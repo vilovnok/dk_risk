@@ -32,3 +32,54 @@ def calculate_mention_metrics(records):
             x["complete"] for x in checks
         ) / total,
     }
+
+
+
+def calculate_mention_metrics(records):
+    checks = [
+        check
+        for record in records
+        if record.get("status") == "completed"
+        for check in record.get("mention_checks", [])
+    ]
+
+    total = len(checks)
+
+    if total == 0:
+        return {
+            "mention_total": 0,
+            "mention_exact_accuracy": 0.0,
+            "mention_semantic_accuracy": 0.0,
+            "mention_grounded_accuracy": 0.0,
+            "mention_completeness_accuracy": 0.0,
+            "mention_missing_rate": 0.0,
+        }
+
+    return {
+        "mention_total": total,
+
+        "mention_exact_accuracy": sum(
+            bool(x.get("exact_match", False))
+            for x in checks
+        ) / total,
+
+        "mention_semantic_accuracy": sum(
+            bool(x.get("semantic_match", False))
+            for x in checks
+        ) / total,
+
+        "mention_grounded_accuracy": sum(
+            bool(x.get("grounded", False))
+            for x in checks
+        ) / total,
+
+        "mention_completeness_accuracy": sum(
+            bool(x.get("complete", False))
+            for x in checks
+        ) / total,
+
+        "mention_missing_rate": sum(
+            not bool(x.get("predicted_mention"))
+            for x in checks
+        ) / total,
+    }
