@@ -1,3 +1,4 @@
+
 import argparse
 import hashlib
 import json
@@ -17,9 +18,9 @@ from typing import Any
 
 from tqdm import tqdm
 
-from classifier.embedder import MentionEmbedder
 from classifier.evaluator import DatasetEvaluator
 from classifier.llm import LLMClient
+from classifier.mention_checker import MentionChecker
 from classifier.metrics import calculate_metrics
 from classifier.tracker import ExperimentTracker
 
@@ -28,11 +29,7 @@ from config import (
     DATABASE_PATH,
     DEFAULT_MODEL,
     DEFAULT_WORKERS,
-    EMBEDDING_BATCH_SIZE,
-    EMBEDDING_DEVICE,
-    EMBEDDING_MODEL,
     MAX_TOKENS,
-    MENTION_THRESHOLD,
     OUTPUT_DIR,
     RUNS_DIR,
     TEMPERATURE,
@@ -45,30 +42,67 @@ from prompts.sales_evaluation import SYSTEM_PROMPT
 logger = logging.getLogger(__name__)
 
 
+# ---------------------------------------------------------------------
+# Logging
+# ---------------------------------------------------------------------
+
 def setup_logging():
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s | %(levelname)s | %(message)s",
-        handlers=[logging.StreamHandler(sys.stdout)],
+        handlers=[
+            logging.StreamHandler(sys.stdout),
+        ],
     )
 
+
+# ---------------------------------------------------------------------
+# Arguments
+# ---------------------------------------------------------------------
 
 def parse_args():
     parser = argparse.ArgumentParser(
-        description="Многопоточная оценка моделей для проекта продаж ДК."
+        description=(
+            "Многопоточная оценка моделей для проекта продаж ДК."
+        )
     )
 
+    # Основная LLM
     parser.add_argument(
         "--provider",
         choices=["aihf", "direct"],
         required=True,
+        help="Провайдер основной модели.",
     )
 
     parser.add_argument(
         "--model-name",
         default=DEFAULT_MODEL,
+        help="Название основной модели.",
     )
 
+    # LLM для проверки mention
+    parser.add_argument(
+        "--mention-provider",
+        choices=["aihf", "direct"],
+        default=None,
+        help="Провайдер модели проверки mention. По умолчанию основной.",
+    )
+
+    parser.add_argument(
+        "--mention-model-name",
+        default=None,
+        help="Модель проверки mention. По умолчанию основная.",
+    )
+
+    parser.add_argument(
+        "--mention-max-tokens",
+        type=int,
+        default=4000,
+        help="Максимальное количество токенов для проверки mention.",
+    )
+
+    # Experiment
     parser.add_argument(
         "--experiment-name",
         default="debit-card-evaluation",
@@ -82,6 +116,7 @@ def parse_args():
         default=[1],
     )
 
+    # Parallelism
     parser.add_argument(
         "--workers",
         type=int,
@@ -95,6 +130,7 @@ def parse_args():
         help="Максимум одновременно отправленных запросов.",
     )
 
+    # Main LLM parameters
     parser.add_argument(
         "--temperature",
         type=float,
@@ -113,35 +149,14 @@ def parse_args():
         default=MAX_TOKENS,
     )
 
-    parser.add_argument(
-        "--mention-threshold",
-        type=float,
-        default=MENTION_THRESHOLD,
-    )
-
-    parser.add_argument(
-        "--embedding-model",
-        default=EMBEDDING_MODEL,
-    )
-
-    parser.add_argument(
-        "--device",
-        choices=["auto", "cpu", "cuda", "mps"],
-        default=EMBEDDING_DEVICE,
-    )
-
-    parser.add_argument(
-        "--embedding-batch-size",
-        type=int,
-        default=EMBEDDING_BATCH_SIZE,
-    )
-
+    # Dataset
     parser.add_argument(
         "--limit",
         type=int,
         default=None,
     )
 
+    # Run management
     parser.add_argument(
         "--run-id",
         default=None,
@@ -154,6 +169,7 @@ def parse_args():
         help="Продолжить существующий эксперимент.",
     )
 
+    # Paths
     parser.add_argument(
         "--output-dir",
         type=Path,
@@ -168,6 +184,10 @@ def parse_args():
 
     return parser.parse_args()
 
+
+# ---------------------------------------------------------------------
+# Dataset
+# ---------------------------------------------------------------------
 
 def load_dataset(path: Path) -> list[dict[str, Any]]:
     if not path.exists():
@@ -187,7 +207,10 @@ def load_dataset(path: Path) -> list[dict[str, Any]]:
                 f"Запись {index} должна быть объектом."
             )
 
-        if not isinstance(record.get("part_system_prompt"), str):
+        if not isinstance(
+            record.get("part_system_prompt"),
+            str,
+        ):
             raise ValueError(
                 f"Некорректный part_system_prompt: запись {index}"
             )
@@ -197,17 +220,42 @@ def load_dataset(path: Path) -> list[dict[str, Any]]:
                 f"Некорректный result: запись {index}"
             )
 
-        for criterion in record["result"]:
-            if not all(
-                key in criterion
-                for key in ("name", "answer", "comment", "mention")
-            ):
+        for criterion_index, criterion in enumerate(
+            record["result"]
+        ):
+            if not isinstance(criterion, dict):
                 raise ValueError(
-                    f"Некорректный критерий: запись {index}"
+                    f"Критерий {criterion_index} записи {index} "
+                    "должен быть объектом."
+                )
+
+            required_fields = {
+                "name",
+                "answer",
+                "comment",
+                "mention",
+            }
+
+            missing = required_fields - criterion.keys()
+
+            if missing:
+                raise ValueError(
+                    f"В критерии {criterion_index} записи {index} "
+                    f"отсутствуют поля: {missing}"
+                )
+
+            if str(criterion["answer"]) not in {"0", "1"}:
+                raise ValueError(
+                    f"Некорректный answer в записи {index}: "
+                    f"{criterion['answer']}"
                 )
 
     return data
 
+
+# ---------------------------------------------------------------------
+# File utilities
+# ---------------------------------------------------------------------
 
 def sha256_file(path: Path) -> str:
     digest = hashlib.sha256()
@@ -232,7 +280,10 @@ def save_json(path: Path, data: Any):
         path.suffix + ".tmp"
     )
 
-    with temporary_path.open("w", encoding="utf-8") as file:
+    with temporary_path.open(
+        "w",
+        encoding="utf-8",
+    ) as file:
         json.dump(
             data,
             file,
@@ -243,10 +294,22 @@ def save_json(path: Path, data: Any):
     temporary_path.replace(path)
 
 
+# ---------------------------------------------------------------------
+# Experiment configuration
+# ---------------------------------------------------------------------
+
 def build_run_config(args, dataset_hashes):
     prompt_hash = hashlib.sha256(
         SYSTEM_PROMPT.encode("utf-8")
     ).hexdigest()
+
+    mention_provider = (
+        args.mention_provider or args.provider
+    )
+
+    mention_model_name = (
+        args.mention_model_name or args.model_name
+    )
 
     return {
         "provider": args.provider,
@@ -254,12 +317,16 @@ def build_run_config(args, dataset_hashes):
         "temperature": args.temperature,
         "top_p": args.top_p,
         "max_tokens": args.max_tokens,
-        "embedding_model": args.embedding_model,
-        "embedding_device": args.device,
-        "embedding_batch_size": args.embedding_batch_size,
-        "mention_threshold": args.mention_threshold,
+
+        "mention_provider": mention_provider,
+        "mention_model_name": mention_model_name,
+        "mention_temperature": 0.0,
+        "mention_top_p": 1.0,
+        "mention_max_tokens": args.mention_max_tokens,
+
         "system_prompt_sha256": prompt_hash,
         "dataset_hashes": dataset_hashes,
+
         "pools": args.pools,
         "limit": args.limit,
         "workers": args.workers,
@@ -270,7 +337,8 @@ def validate_resume_config(
     existing_config: dict[str, Any],
     new_config: dict[str, Any],
 ):
-    # Количество потоков можно менять при продолжении.
+    # Количество потоков можно менять.
+    # Остальные параметры моделей и датасета должны совпадать.
     old = dict(existing_config)
     new = dict(new_config)
 
@@ -285,6 +353,10 @@ def validate_resume_config(
             f"Новые параметры: {new}"
         )
 
+
+# ---------------------------------------------------------------------
+# Parallel LLM evaluation
+# ---------------------------------------------------------------------
 
 def run_llm_parallel(
     run_id: str,
@@ -305,13 +377,24 @@ def run_llm_parallel(
         )
     ]
 
+    completed_count = (
+        len(dataset) - len(pending_indices)
+    )
+
     logger.info(
         "Pool %s: всего %s, готово %s, осталось %s.",
         pool_number,
         len(dataset),
-        len(dataset) - len(pending_indices),
+        completed_count,
         len(pending_indices),
     )
+
+    if not pending_indices:
+        logger.info(
+            "Pool %s: все записи уже обработаны.",
+            pool_number,
+        )
+        return
 
     def process(index: int):
         return evaluator.evaluate_record(
@@ -329,7 +412,7 @@ def run_llm_parallel(
 
         with tqdm(
             total=len(pending_indices),
-            desc=f"LLM pool {pool_number}",
+            desc=f"Pool {pool_number}",
         ) as progress:
 
             def submit_next():
@@ -338,12 +421,18 @@ def run_llm_parallel(
                 except StopIteration:
                     return False
 
-                future = executor.submit(process, index)
+                future = executor.submit(
+                    process,
+                    index,
+                )
+
                 futures[future] = index
 
                 return True
 
-            for _ in range(min(max_inflight, len(pending_indices))):
+            for _ in range(
+                min(max_inflight, len(pending_indices))
+            ):
                 submit_next()
 
             while futures:
@@ -368,7 +457,7 @@ def run_llm_parallel(
 
                     except Exception as exc:
                         logger.exception(
-                            "Ошибка: pool=%s, record=%s",
+                            "Ошибка обработки: pool=%s, record=%s",
                             pool_number,
                             index,
                         )
@@ -386,134 +475,45 @@ def run_llm_parallel(
                     submit_next()
 
 
-def calculate_mentions(
-    run_id: str,
-    pool_number: int,
-    tracker: ExperimentTracker,
-    embedder: MentionEmbedder,
-):
-    """
-    Централизованное вычисление embeddings.
-
-    LLM-ответы уже сохранены в SQLite.
-    Здесь вычисляем similarity и обновляем записи.
-    """
-
-    records = tracker.load_records(
-        run_id=run_id,
-        pool=pool_number,
-    )
-
-    texts = []
-    tasks = []
-
-    for record_position, record in enumerate(records):
-        gold = record["gold"]
-        predictions = record["predictions"]
-
-        for criterion_position, (gold_item, prediction) in enumerate(
-            zip(gold, predictions)
-        ):
-            if str(gold_item.get("answer", "0")) != "1":
-                prediction["mention_similarity"] = 0.0
-                prediction["mention_exact_match"] = False
-                prediction["mention_match"] = False
-                continue
-
-            gold_mention = str(
-                gold_item.get("mention", "")
-            ).strip()
-
-            predicted_mention = str(
-                prediction.get("mention", "")
-            ).strip()
-
-            prediction["mention_exact_match"] = (
-                bool(predicted_mention)
-                and gold_mention == predicted_mention
-            )
-
-            if not gold_mention or not predicted_mention:
-                prediction["mention_similarity"] = 0.0
-                prediction["mention_match"] = False
-                continue
-
-            texts.extend([
-                gold_mention,
-                predicted_mention,
-            ])
-
-            tasks.append((
-                record_position,
-                criterion_position,
-            ))
-
-    logger.info(
-        "Pool %s: подготовлено %s текстов для embeddings.",
-        pool_number,
-        len(texts),
-    )
-
-    if texts:
-        vectors = embedder.encode(texts)
-
-        for task_position, (
-            record_position,
-            criterion_position,
-        ) in enumerate(tasks):
-
-            gold_vector = vectors[task_position * 2]
-            predicted_vector = vectors[task_position * 2 + 1]
-
-            similarity = float(
-                (gold_vector * predicted_vector).sum()
-            )
-
-            prediction = records[record_position]["predictions"][
-                criterion_position
-            ]
-
-            prediction["mention_similarity"] = similarity
-
-            prediction["mention_match"] = (
-                similarity >= embedder.mention_threshold
-                if hasattr(embedder, "mention_threshold")
-                else False
-            )
-
-    # Сохраняем обновлённые результаты.
-    # Индексы записей восстановим через record_index.
-    for record in records:
-        tracker.save_record(
-            run_id=run_id,
-            pool=pool_number,
-            record_index=record["record_index"],
-            status="completed",
-            result=record,
-        )
-
-    return records
-
+# ---------------------------------------------------------------------
+# Pool evaluation
+# ---------------------------------------------------------------------
 
 def evaluate_pool(
     run_id: str,
     pool_number: int,
     args,
     evaluator: DatasetEvaluator,
-    embedder: MentionEmbedder,
     tracker: ExperimentTracker,
 ):
-    input_path = DATA_DIR / f"pool_{pool_number}_prepared.json"
+    input_path = (
+        DATA_DIR / f"pool_{pool_number}_prepared.json"
+    )
 
-    logger.info("Загрузка %s", input_path)
+    logger.info(
+        "Загрузка датасета: %s",
+        input_path,
+    )
 
     dataset = load_dataset(input_path)
 
     if args.limit is not None:
         dataset = dataset[:args.limit]
 
-    max_inflight = args.max_inflight or args.workers * 2
+    max_inflight = (
+        args.max_inflight
+        if args.max_inflight is not None
+        else args.workers * 2
+    )
 
+    # Этап 1:
+    # Основная LLM оценивает критерии и формирует mention.
+    #
+    # Этап 2:
+    # MentionChecker вызывает проверяющую LLM
+    # и сравнивает эталонную и предсказанную цитаты.
+    #
+    # Оба этапа выполняются внутри evaluator.evaluate_record().
     run_llm_parallel(
         run_id=run_id,
         pool_number=pool_number,
@@ -524,18 +524,15 @@ def evaluate_pool(
         max_inflight=max_inflight,
     )
 
-    # Ошибочные записи не включаем в метрики качества.
-    # Они учитываются отдельно как ошибки запуска.
-    records = calculate_mentions(
+    # Загружаем сохранённые результаты из SQLite.
+    records = tracker.load_records(
         run_id=run_id,
-        pool_number=pool_number,
-        tracker=tracker,
-        embedder=embedder,
+        pool=pool_number,
     )
 
+    # Метрики классификации и LLM-проверки mention.
     overall, criterion_metrics = calculate_metrics(
         records=records,
-        mention_threshold=args.mention_threshold,
     )
 
     statuses = tracker.get_record_status_counts(
@@ -543,8 +540,16 @@ def evaluate_pool(
         pool_number,
     )
 
-    overall["failed_records"] = statuses.get("error", 0)
-    overall["completed_records"] = statuses.get("completed", 0)
+    overall["failed_records"] = statuses.get(
+        "error",
+        0,
+    )
+
+    overall["completed_records"] = statuses.get(
+        "completed",
+        0,
+    )
+
     overall["expected_records"] = len(dataset)
 
     tracker.save_metrics(
@@ -554,6 +559,7 @@ def evaluate_pool(
         criterion_metrics=criterion_metrics,
     )
 
+    # Экспорт результатов.
     run_dir = args.output_dir / "runs" / run_id
     pool_dir = run_dir / f"pool_{pool_number}"
 
@@ -574,45 +580,92 @@ def evaluate_pool(
 
     logger.info(
         "Pool %s | accuracy=%.4f | F1=%.4f | "
-        "mention similarity=%.4f | errors=%s",
+        "mention semantic=%.4f | errors=%s",
         pool_number,
-        overall["accuracy"],
-        overall["f1"],
-        overall["mention_similarity_mean"],
+        overall.get("accuracy", 0.0),
+        overall.get("f1", 0.0),
+        overall.get("mention_semantic_accuracy", 0.0),
         statuses.get("error", 0),
     )
 
 
+# ---------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------
+
 def main():
     setup_logging()
+
     args = parse_args()
 
     if args.workers < 1:
-        raise ValueError("--workers должен быть не меньше 1.")
+        raise ValueError(
+            "--workers должен быть не меньше 1."
+        )
 
-    if args.max_inflight is not None and args.max_inflight < 1:
-        raise ValueError("--max-inflight должен быть не меньше 1.")
+    if (
+        args.max_inflight is not None
+        and args.max_inflight < 1
+    ):
+        raise ValueError(
+            "--max-inflight должен быть не меньше 1."
+        )
 
     if args.limit is not None and args.limit < 1:
-        raise ValueError("--limit должен быть не меньше 1.")
+        raise ValueError(
+            "--limit должен быть не меньше 1."
+        )
 
-    if not 0.0 <= args.mention_threshold <= 1.0:
-        raise ValueError("--mention-threshold должен быть от 0 до 1.")
+    if args.max_tokens < 1:
+        raise ValueError(
+            "--max-tokens должен быть больше 0."
+        )
 
-    args.output_dir.mkdir(parents=True, exist_ok=True)
-    RUNS_DIR.mkdir(parents=True, exist_ok=True)
+    if args.mention_max_tokens < 1:
+        raise ValueError(
+            "--mention-max-tokens должен быть больше 0."
+        )
 
-    tracker = ExperimentTracker(args.database)
+    args.output_dir.mkdir(
+        parents=True,
+        exist_ok=True,
+    )
+
+    RUNS_DIR.mkdir(
+        parents=True,
+        exist_ok=True,
+    )
+
+    # -------------------------------------------------------------
+    # Tracker
+    # -------------------------------------------------------------
+
+    tracker = ExperimentTracker(
+        args.database,
+    )
+
+    # -------------------------------------------------------------
+    # Dataset hashes
+    # -------------------------------------------------------------
 
     dataset_hashes = {}
 
     for pool_number in args.pools:
-        path = DATA_DIR / f"pool_{pool_number}_prepared.json"
+        path = (
+            DATA_DIR
+            / f"pool_{pool_number}_prepared.json"
+        )
 
         if not path.exists():
             raise FileNotFoundError(path)
 
-        dataset_hashes[str(pool_number)] = sha256_file(path)
+        dataset_hashes[str(pool_number)] = (
+            sha256_file(path)
+        )
+
+    # -------------------------------------------------------------
+    # Experiment configuration
+    # -------------------------------------------------------------
 
     config = build_run_config(
         args,
@@ -621,7 +674,10 @@ def main():
 
     if args.resume_run_id:
         run_id = args.resume_run_id
-        existing = tracker.get_run(run_id)
+
+        existing = tracker.get_run(
+            run_id,
+        )
 
         if not existing:
             raise ValueError(
@@ -637,13 +693,21 @@ def main():
             config,
         )
 
-        logger.info("Продолжаем эксперимент: %s", run_id)
+        logger.info(
+            "Продолжаем эксперимент: %s",
+            run_id,
+        )
 
     else:
-        run_id = args.run_id or (
-            datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
-            + "_"
-            + uuid.uuid4().hex[:8]
+        run_id = (
+            args.run_id
+            or (
+                datetime.now(timezone.utc).strftime(
+                    "%Y%m%dT%H%M%SZ"
+                )
+                + "_"
+                + uuid.uuid4().hex[:8]
+            )
         )
 
         tracker.create_run(
@@ -654,40 +718,84 @@ def main():
             config=config,
         )
 
-    logger.info("Run ID: %s", run_id)
-    logger.info("Provider: %s", args.provider)
-    logger.info("Model: %s", args.model_name)
-    logger.info("Workers: %s", args.workers)
+    # -------------------------------------------------------------
+    # LLM clients
+    # -------------------------------------------------------------
+
+    mention_provider = (
+        args.mention_provider or args.provider
+    )
+
+    mention_model_name = (
+        args.mention_model_name or args.model_name
+    )
+
+    logger.info(
+        "Run ID: %s",
+        run_id,
+    )
+
+    logger.info(
+        "Основная LLM: provider=%s, model=%s",
+        args.provider,
+        args.model_name,
+    )
+
+    logger.info(
+        "Mention LLM: provider=%s, model=%s",
+        mention_provider,
+        mention_model_name,
+    )
+
+    logger.info(
+        "Workers: %s",
+        args.workers,
+    )
+
+    # Основной клиент.
+    llm_client = LLMClient(
+        provider=args.provider,
+        model_name=args.model_name,
+        temperature=args.temperature,
+        top_p=args.top_p,
+        max_tokens=args.max_tokens,
+    )
+
+    # Отдельный клиент для проверки mention.
+    mention_client = LLMClient(
+        provider=mention_provider,
+        model_name=mention_model_name,
+        temperature=0.0,
+        top_p=1.0,
+        max_tokens=args.mention_max_tokens,
+    )
+
+    mention_checker = MentionChecker(
+        mention_client,
+    )
+
+    evaluator = DatasetEvaluator(
+        llm_client=llm_client,
+        mention_checker=mention_checker,
+    )
+
+    # -------------------------------------------------------------
+    # Evaluate pools
+    # -------------------------------------------------------------
 
     try:
-        llm = LLMClient(
-            provider=args.provider,
-            model_name=args.model_name,
-            temperature=args.temperature,
-            top_p=args.top_p,
-            max_tokens=args.max_tokens,
-        )
-
-        evaluator = DatasetEvaluator(llm)
-
-        embedder = MentionEmbedder(
-            model_name=args.embedding_model,
-            device=args.device,
-            batch_size=args.embedding_batch_size,
-        )
-
-        # Порог используется при расчёте similarity.
-        embedder.mention_threshold = args.mention_threshold
-
         for pool_number in args.pools:
             evaluate_pool(
                 run_id=run_id,
                 pool_number=pool_number,
                 args=args,
                 evaluator=evaluator,
-                embedder=embedder,
                 tracker=tracker,
             )
+
+        # ---------------------------------------------------------
+        # Final status
+        # ---------------------------------------------------------
 
         all_statuses = []
 
@@ -710,11 +818,21 @@ def main():
             else "completed"
         )
 
-        tracker.update_run_status(run_id, status)
+        tracker.update_run_status(
+            run_id,
+            status,
+        )
 
-        exported = tracker.export_run(run_id)
+        # Экспорт из SQLite.
+        tracker.export_run(
+            run_id,
+        )
 
-        run_dir = args.output_dir / "runs" / run_id
+        run_dir = (
+            args.output_dir
+            / "runs"
+            / run_id
+        )
 
         save_json(
             run_dir / "run.json",
@@ -728,14 +846,36 @@ def main():
             },
         )
 
-        logger.info("Эксперимент завершён: %s", run_id)
-        logger.info("Статус: %s", status)
-        logger.info("SQLite: %s", args.database)
-        logger.info("Результаты: %s", run_dir)
+        logger.info(
+            "Эксперимент завершён: %s",
+            run_id,
+        )
+
+        logger.info(
+            "Статус: %s",
+            status,
+        )
+
+        logger.info(
+            "SQLite: %s",
+            args.database,
+        )
+
+        logger.info(
+            "Результаты: %s",
+            run_dir,
+        )
 
     except Exception:
-        tracker.update_run_status(run_id, "failed")
-        logger.exception("Эксперимент завершился с ошибкой.")
+        tracker.update_run_status(
+            run_id,
+            "failed",
+        )
+
+        logger.exception(
+            "Эксперимент завершился с ошибкой."
+        )
+
         raise
 
 
@@ -743,12 +883,11 @@ if __name__ == "__main__":
     main()
 
 
-
 # python main.py \
 #     --provider direct \
 #     --model-name DeepSeek-V4.1-Flash \
-#     --experiment-name baseline \
+#     --mention-provider aihf \
+#     --mention-model-name DeepSeek-V4.1-Flash \
+#     --experiment-name mention-validation \
 #     --pools 1 \
-#     --limit 10 \
-#     --workers 4 \
-#     --max-inflight 8
+#     --workers 4
