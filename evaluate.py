@@ -1291,18 +1291,6 @@ def load_input(input_path: Path) -> list[dict]:
     return data
 
 
-def load_system_prompt(prompt_path: Path) -> str:
-    if not prompt_path.exists():
-        raise FileNotFoundError(
-            f"Файл системного промпта не найден: {prompt_path}"
-        )
-
-    prompt = prompt_path.read_text(encoding="utf-8-sig").strip()
-    if not prompt:
-        raise ValueError("Файл системного промпта пуст.")
-
-    return prompt
-
 
 def validate_input(data: list[dict], input_field: str):
     if not data:
@@ -1457,7 +1445,7 @@ def run_evaluation(args):
     prompt_path = Path(args.system_prompt_file)
 
     data = load_input(input_path)
-    system_prompt = load_system_prompt(prompt_path)
+    system_prompt = SYSTEM_PROMPT
 
     validate_input(
         data=data,
