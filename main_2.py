@@ -37,13 +37,13 @@ def build_part_system_prompt(item: dict[str, Any]) -> str:
     )
 
     class_names = [
-        str(cls["name"])
+        " ".join(str(cls["name"]).split())
         for cls in classes
         if isinstance(cls, dict) and cls.get("name")
     ]
 
     variants = "\n".join(
-        f"{index}. {name}"
+        f"- {name}"
         for index, name in enumerate(class_names, start=1)
     )
 

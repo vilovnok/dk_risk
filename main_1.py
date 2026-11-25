@@ -1,4 +1,3 @@
-
 import argparse
 import json
 import logging
@@ -58,6 +57,43 @@ def build_best_results_index(
     return best_results
 
 
+def extract_unique_names(
+    merged_data: list[dict[str, Any]],
+) -> list[dict[str, str]]:
+    unique_names = set()
+
+    for item in merged_data:
+        filename = item.get("filename")
+        result = item.get("result")
+
+        if not filename or not isinstance(result, list):
+            continue
+
+        for obj in result:
+            if not isinstance(obj, dict):
+                continue
+
+            name = obj.get("name")
+
+            if not name:
+                continue
+
+            unique_names.add(
+                (
+                    filename,
+                    name.strip(),
+                )
+            )
+
+    return [
+        {
+            "file_name": filename,
+            "name": name,
+        }
+        for filename, name in sorted(unique_names)
+    ]
+
+
 def merge_arrays(
     source_data: list[dict[str, Any]],
     results_data: list[dict[str, Any]],
@@ -94,7 +130,11 @@ def process_pool(
     output_path: Path,
 ) -> None:
 
-    logger.info("Обработка пары: %s + %s", source_path.name, results_path.name)
+    logger.info(
+        "Обработка пары: %s + %s",
+        source_path.name,
+        results_path.name,
+    )
 
     if not source_path.exists():
         logger.error("Исходный файл не найден: %s", source_path)
@@ -112,6 +152,8 @@ def process_pool(
         results_data,
     )
 
+    unique_names = extract_unique_names(merged_data)
+
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
     with output_path.open("w", encoding="utf-8") as file:
@@ -125,12 +167,13 @@ def process_pool(
     logger.info("Исходных объектов: %d", len(source_data))
     logger.info("Сопоставлено: %d", matched)
     logger.info("Без соответствия: %d", unmatched)
+    logger.info("Уникальных пар file_name + name: %d", len(unique_names))
     logger.info("Результат сохранён: %s", output_path)
 
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Объединение трёх пар JSON-файлов."
+        description="Объединение JSON-файлов и извлечение уникальных name."
     )
 
     parser.add_argument(
@@ -163,7 +206,7 @@ def main():
         source_path = args.input_dir / f"pool_{pool_number}.json"
         results_path = args.input_dir / f"pool_{pool_number}_gt.json"
         output_path = output_dir / f"pool_{pool_number}_merged.json"
-
+        
         process_pool(
             source_path,
             results_path,
@@ -173,5 +216,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
-

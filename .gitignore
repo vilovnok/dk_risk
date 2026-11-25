@@ -1,0 +1,3 @@
+data/*
+info/*
+predicts/pool_*_merged.json*
