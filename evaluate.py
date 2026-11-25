@@ -721,47 +721,31 @@ SYSTEM_PROMPT = """
 
 
 
-#!/usr/bin/env python3
-# -*- coding: utf-8 -*-
-
-"""
-Многопоточная оценка диалогов через LLM и сравнение результатов
-с эталонной разметкой исключительно по полю `name`.
-
-Входной JSON:
-[
-  {
-    "part_system_prompt": "...",
-    "result": [{"name": "...", "answer": "0", ...}]
-  }
-]
-
-Сравнение:
-- сравниваются только result[*].name и llm_result[*].name;
-- порядок элементов не важен;
-- пробелы и переносы строк нормализуются;
-- служебный критерий fork игнорируется;
-- mention / answer / comment не используются.
-
-Важно:
-1. Перед запуском укажите корректный импорт TagmeClientAdvanced
-   в блоке IMPORTS, если путь в вашем окружении отличается.
-2. Передайте файл с системным промптом через --system-prompt-file.
-"""
 
 import argparse
+import csv
 import json
 import logging
 import os
 import re
 import threading
 import time
-from concurrent.futures import ThreadPoolExecutor, as_completed
-from pathlib import Path
-from typing import Any
 
 import requests
 import urllib3
+
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from datetime import datetime
+from pathlib import Path
+from typing import Any
+
+
+# Сохрани здесь свой существующий импорт:
+# from ... import TagmeClientAdvanced
+
+# Сохрани здесь существующий SYSTEM_PROMPT без изменений:
+# SYSTEM_PROMPT = """..."""
+
 
 # ============================================================
 # CONFIG
@@ -770,7 +754,7 @@ import urllib3
 ENDPOINTS = {
     "direct": "https://tagme.sberdevices.ru/ai/llm/v1/chat/completions",
     "aihf": "https://tagme.sberdevices.ru/x/aihf/llm/v1/chat/completions",
-    "sigma": "https://tagme.sigma.sbrf.ru/ai/llm/v1/chat/completions"
+    "sigma": "https://tagme.sigma.sbrf.ru/ai/llm/v1/chat/completions",
 }
 
 CFG = {
@@ -792,12 +776,28 @@ RETRY_DELAYS = (2, 4)
 INPUT_FIELD = "part_system_prompt"
 CHECKPOINT_EVERY = 10
 
-# Служебные имена, которые не участвуют в сравнении.
 IGNORE_NAMES = {"fork"}
+
+CSV_FIELDS = [
+    "timestamp",
+    "model",
+    "id",
+    "accuracy",
+]
+
+JSON_FIELDS = [
+    "id",
+    "model",
+    "timestamp",
+    "gt_ground_truth",
+    "prediction",
+]
 
 _thread_local = threading.local()
 
-urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+urllib3.disable_warnings(
+    urllib3.exceptions.InsecureRequestWarning
+)
 
 
 # ============================================================
@@ -809,7 +809,142 @@ logging.basicConfig(
     format="%(asctime)s | %(levelname)s | %(message)s",
     datefmt="%Y-%m-%d %H:%M:%S",
 )
+
 logger = logging.getLogger(__name__)
+
+
+# ============================================================
+# NAME NORMALIZATION
+# ============================================================
+
+def normalize_name(name: str) -> str:
+    """Нормализует пробелы и переносы строк."""
+
+    return " ".join(name.split())
+
+
+_NORMALIZED_IGNORE_NAMES = {
+    normalize_name(name).casefold()
+    for name in IGNORE_NAMES
+}
+
+
+def normalize_and_filter_name(
+    name: Any,
+    context: str,
+) -> str | None:
+    """Нормализует название критерия и исключает служебные имена."""
+
+    if not isinstance(name, str) or not name.strip():
+        raise ValueError(
+            f"{context}: некорректное поле name."
+        )
+
+    normalized = normalize_name(name)
+
+    if normalized.casefold() in _NORMALIZED_IGNORE_NAMES:
+        return None
+
+    return normalized
+
+
+def is_positive_answer(answer: Any) -> bool:
+    """Проверяет, является ли answer положительным."""
+
+    if isinstance(answer, bool):
+        return answer is True
+
+    if isinstance(answer, (int, float)):
+        return answer == 1
+
+    if isinstance(answer, str):
+        return answer.strip() in {"1", "1.0"}
+
+    return False
+
+
+# ============================================================
+# NAME EXTRACTION
+# ============================================================
+
+def extract_ground_truth_names(
+    items: Any,
+    field_description: str,
+) -> set[str]:
+    """
+    Извлекает положительные критерии из result.
+
+    Ground Truth:
+        result[*].name, если result[*].answer == 1.
+
+    fork исключается.
+    """
+
+    if not isinstance(items, list):
+        raise ValueError(
+            f"{field_description}: ожидался список."
+        )
+
+    names = set()
+
+    for index, item in enumerate(items):
+        if not isinstance(item, dict):
+            raise ValueError(
+                f"{field_description}: элемент {index} "
+                "должен быть объектом."
+            )
+
+        if not is_positive_answer(item.get("answer")):
+            continue
+
+        name = normalize_and_filter_name(
+            item.get("name"),
+            f"{field_description}, элемент {index}",
+        )
+
+        if name is not None:
+            names.add(name)
+
+    return names
+
+
+def extract_predicted_names(
+    items: Any,
+    field_description: str,
+) -> set[str]:
+    """
+    Извлекает предсказанные критерии.
+
+    Prediction:
+        все name из ответа LLM.
+
+    mention не участвует в сравнении.
+    fork исключается.
+    """
+
+    if not isinstance(items, list):
+        raise ValueError(
+            f"{field_description}: ожидался список."
+        )
+
+    names = set()
+
+    for index, item in enumerate(items):
+        if not isinstance(item, dict):
+            raise ValueError(
+                f"{field_description}: элемент {index} "
+                "должен быть объектом."
+            )
+
+        name = normalize_and_filter_name(
+            item.get("name"),
+            f"{field_description}, элемент {index}",
+        )
+
+        if name is not None:
+            names.add(name)
+
+    return names
 
 
 # ============================================================
@@ -817,6 +952,7 @@ logger = logging.getLogger(__name__)
 # ============================================================
 
 class GigaChatClient:
+
     def __init__(
         self,
         provider: str,
@@ -825,18 +961,24 @@ class GigaChatClient:
         top_p: float,
     ):
         if provider not in ENDPOINTS:
-            raise ValueError(f"Неизвестный provider: {provider}")
+            raise ValueError(
+                f"Неизвестный provider: {provider}"
+            )
 
         self.provider = provider
         self.model = model
         self.temperature = temperature
         self.top_p = top_p
         self.url = ENDPOINTS[provider]
+
         self.session = requests.Session()
         self.token = self._get_token()
 
     def _get_token(self) -> str:
-        config_path = os.path.expanduser(CFG[self.provider])
+        config_path = os.path.expanduser(
+            CFG[self.provider]
+        )
+
         client = TagmeClientAdvanced(config_path)
         token = client.client.token
 
@@ -847,12 +989,23 @@ class GigaChatClient:
 
         return token
 
-    def invoke(self, system_prompt: str, user_prompt: str) -> str:
+    def invoke(
+        self,
+        system_prompt: str,
+        user_prompt: str,
+    ) -> str:
+
         payload = {
             "model": self.model,
             "messages": [
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": user_prompt},
+                {
+                    "role": "system",
+                    "content": system_prompt,
+                },
+                {
+                    "role": "user",
+                    "content": user_prompt,
+                },
             ],
             "temperature": self.temperature,
             "top_p": self.top_p,
@@ -874,9 +1027,14 @@ class GigaChatClient:
         )
 
         if response.status_code == 401:
-            logger.warning("HTTP 401. Обновляю токен.")
+            logger.warning(
+                "HTTP 401. Обновляю токен."
+            )
+
             self.token = self._get_token()
-            headers["Authorization"] = f"Bearer {self.token}"
+            headers["Authorization"] = (
+                f"Bearer {self.token}"
+            )
 
             response = self.session.post(
                 self.url,
@@ -887,10 +1045,12 @@ class GigaChatClient:
             )
 
         response.raise_for_status()
+
         data = response.json()
 
         try:
             content = data["choices"][0]["message"]["content"]
+
         except (KeyError, IndexError, TypeError) as exc:
             raise RuntimeError(
                 f"Не удалось извлечь ответ модели: {data}"
@@ -904,7 +1064,9 @@ class GigaChatClient:
             )
 
         if not isinstance(content, str) or not content.strip():
-            raise RuntimeError("Модель вернула пустой ответ.")
+            raise RuntimeError(
+                "Модель вернула пустой ответ."
+            )
 
         return content.strip()
 
@@ -914,7 +1076,11 @@ class GigaChatClient:
 # ============================================================
 
 def get_client(args):
-    client = getattr(_thread_local, "client", None)
+    client = getattr(
+        _thread_local,
+        "client",
+        None,
+    )
 
     if client is None:
         client = GigaChatClient(
@@ -923,13 +1089,18 @@ def get_client(args):
             temperature=args.temperature,
             top_p=args.top_p,
         )
+
         _thread_local.client = client
 
     return client
 
 
 def reset_client():
-    client = getattr(_thread_local, "client", None)
+    client = getattr(
+        _thread_local,
+        "client",
+        None,
+    )
 
     if client is not None:
         try:
@@ -945,21 +1116,29 @@ def reset_client():
 # ============================================================
 
 def extract_json_array(raw_response: str) -> str:
-    """Извлекает JSON-массив из ответа, включая Markdown-обрамление."""
+    """Извлекает JSON-массив из ответа модели."""
 
     text = raw_response.strip()
+
     text = re.sub(
         r"^\s*```(?:json)?\s*",
         "",
         text,
         flags=re.IGNORECASE,
     )
-    text = re.sub(r"\s*```\s*$", "", text)
+
+    text = re.sub(
+        r"\s*```\s*$",
+        "",
+        text,
+    )
 
     try:
         parsed = json.loads(text)
+
         if isinstance(parsed, list):
             return text
+
     except json.JSONDecodeError:
         pass
 
@@ -967,36 +1146,59 @@ def extract_json_array(raw_response: str) -> str:
     end = text.rfind("]")
 
     if start == -1 or end == -1 or end <= start:
-        raise ValueError("В ответе не найден JSON-массив.")
+        raise ValueError(
+            "В ответе не найден JSON-массив."
+        )
 
     candidate = text[start:end + 1]
+
     parsed = json.loads(candidate)
 
     if not isinstance(parsed, list):
-        raise ValueError("Ожидался JSON-массив.")
+        raise ValueError(
+            "Ожидался JSON-массив."
+        )
 
     return candidate
 
 
-def parse_response(raw_response: str) -> list[dict]:
-    result = json.loads(extract_json_array(raw_response))
+def parse_response(
+    raw_response: str,
+) -> list[dict[str, str]]:
+    """Проверяет структуру ответа LLM."""
+
+    result = json.loads(
+        extract_json_array(raw_response)
+    )
 
     if not isinstance(result, list):
-        raise ValueError("Ответ должен быть JSON-массивом.")
+        raise ValueError(
+            "Ответ должен быть JSON-массивом."
+        )
 
     for index, item in enumerate(result):
-        if not isinstance(item, dict):
-            raise ValueError(f"Элемент {index} должен быть объектом.")
 
-        expected_keys = {"name", "mention"}
+        if not isinstance(item, dict):
+            raise ValueError(
+                f"Элемент {index} должен быть объектом."
+            )
+
+        expected_keys = {
+            "name",
+            "mention",
+        }
+
         if set(item.keys()) != expected_keys:
             raise ValueError(
                 f"Элемент {index}: ожидались только поля "
-                f"{sorted(expected_keys)}, получены {sorted(item.keys())}."
+                f"{sorted(expected_keys)}, "
+                f"получены {sorted(item.keys())}."
             )
 
         if not isinstance(item["name"], str):
-            raise ValueError(f"Элемент {index}: name должен быть строкой.")
+            raise ValueError(
+                f"Элемент {index}: name должен быть строкой."
+            )
 
         if not isinstance(item["mention"], str):
             raise ValueError(
@@ -1004,349 +1206,35 @@ def parse_response(raw_response: str) -> list[dict]:
             )
 
         if not item["name"].strip():
-            raise ValueError(f"Элемент {index}: name не должен быть пустым.")
+            raise ValueError(
+                f"Элемент {index}: name не должен быть пустым."
+            )
 
     return result
 
 
 # ============================================================
-# NAME-BASED METRICS
+# INPUT
 # ============================================================
 
+def load_input(
+    input_path: Path,
+) -> list[dict[str, Any]]:
 
-
-# ============================================================
-# NAME EXTRACTION
-# ============================================================
-
-def is_positive_answer(answer: Any) -> bool:
-    """Проверяет, является ли answer положительным."""
-    if isinstance(answer, bool):
-        return answer is True
-
-    if isinstance(answer, (int, float)):
-        return answer == 1
-
-    if isinstance(answer, str):
-        return answer.strip() in {"1", "1.0"}
-
-    return False
-
-
-def normalize_name(name: str) -> str:
-    """Нормализует пробелы и переносы строк."""
-    return " ".join(name.split())
-
-
-# Служебные категории, исключаемые из сравнения.
-_NORMALIZED_IGNORE_NAMES = {
-    normalize_name(name).casefold()
-    for name in IGNORE_NAMES
-}
-
-
-def normalize_and_filter_name(
-    name: Any,
-    context: str,
-) -> str | None:
-    if not isinstance(name, str) or not name.strip():
-        raise ValueError(f"{context}: некорректное поле name.")
-
-    normalized = normalize_name(name)
-
-    if normalized.casefold() in _NORMALIZED_IGNORE_NAMES:
-        return None
-
-    return normalized
-
-
-def extract_ground_truth_names(
-    items: Any,
-    field_description: str,
-) -> set[str]:
-    """
-    Ground Truth формируется только из объектов с answer == 1.
-    """
-    if not isinstance(items, list):
-        raise ValueError(f"{field_description}: ожидался список.")
-
-    names = set()
-
-    for index, item in enumerate(items):
-        if not isinstance(item, dict):
-            raise ValueError(
-                f"{field_description}: элемент {index} должен быть объектом."
-            )
-
-        # В Ground Truth включаем только положительные категории.
-        if not is_positive_answer(item.get("answer")):
-            continue
-
-        name = normalize_and_filter_name(
-            item.get("name"),
-            f"{field_description}, элемент {index}",
-        )
-
-        if name is not None:
-            names.add(name)
-
-    return names
-
-
-def extract_predicted_names(
-    items: Any,
-    field_description: str,
-) -> set[str]:
-    """
-    Из ответа LLM извлекаются все name.
-    mention не участвует в сравнении.
-    """
-    if not isinstance(items, list):
-        raise ValueError(f"{field_description}: ожидался список.")
-
-    names = set()
-
-    for index, item in enumerate(items):
-        if not isinstance(item, dict):
-            raise ValueError(
-                f"{field_description}: элемент {index} должен быть объектом."
-            )
-
-        name = normalize_and_filter_name(
-            item.get("name"),
-            f"{field_description}, элемент {index}",
-        )
-
-        if name is not None:
-            names.add(name)
-
-    return names
-
-
-# ============================================================
-# CSV RESULTS
-# ============================================================
-
-CSV_FIELDS = [
-    "model",
-    "timestamp",
-    "accuracy",
-    "gt_ground_truth",
-    "prediction",
-]
-
-
-def build_csv_row(
-    original_item: dict,
-    llm_record: dict | None,
-    model: str,
-    timestamp: str,
-    row_index: int,
-) -> dict:
-    """
-    Формирует CSV-строку для одного диалога.
-
-    accuracy:
-        1 — полное совпадение множеств GT и Prediction;
-        0 — множества отличаются;
-        пустое значение — невозможно оценить результат.
-    """
-
-    row = {
-        "model": model,
-        "timestamp": timestamp,
-        "accuracy": "",
-        "gt_ground_truth": "",
-        "prediction": "",
-    }
-
-    # Извлекаем Ground Truth независимо от результата инференса.
-    try:
-        gold_names = extract_ground_truth_names(
-            original_item.get("result"),
-            f"result объекта {row_index}",
-        )
-
-        row["gt_ground_truth"] = json.dumps(
-            sorted(gold_names),
-            ensure_ascii=False,
-        )
-
-    except (ValueError, TypeError) as exc:
-        logger.warning(
-            "Объект %s: некорректный Ground Truth: %s",
-            row_index,
-            exc,
-        )
-        return row
-
-    # Если LLM завершилась ошибкой, accuracy не рассчитываем.
-    if (
-        llm_record is None
-        or llm_record.get("llm_error")
-        or llm_record.get("llm_result") is None
-    ):
-        return row
-
-    try:
-        predicted_names = extract_predicted_names(
-            llm_record["llm_result"],
-            f"llm_result объекта {row_index}",
-        )
-
-        row["prediction"] = json.dumps(
-            sorted(predicted_names),
-            ensure_ascii=False,
-        )
-
-        # Exact Match Accuracy для отдельного диалога.
-        row["accuracy"] = int(gold_names == predicted_names)
-
-    except (ValueError, TypeError) as exc:
-        logger.warning(
-            "Объект %s: некорректное предсказание: %s",
-            row_index,
-            exc,
-        )
-
-    return row
-
-
-def append_csv_results(
-    data: list[dict],
-    results: dict[int, dict],
-    output_path: Path,
-    model: str,
-    timestamp: str,
-    row_indices: list[int] | None = None,
-) -> int:
-    """
-    Добавляет результаты в CSV.
-
-    Если файл уже существует, новые строки добавляются в конец.
-    Заголовок создаётся только при первом сохранении.
-
-    Возвращает количество добавленных строк.
-    """
-
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-
-    if row_indices is None:
-        row_indices = sorted(results.keys())
-
-    if not row_indices:
-        return 0
-
-    file_exists = (
-        output_path.exists()
-        and output_path.stat().st_size > 0
-    )
-
-    with output_path.open(
-        "a",
-        encoding="utf-8-sig",
-        newline="",
-    ) as file:
-        writer = csv.DictWriter(
-            file,
-            fieldnames=CSV_FIELDS,
-            extrasaction="ignore",
-        )
-
-        if not file_exists:
-            writer.writeheader()
-
-        for row_index in row_indices:
-            if row_index < 0 or row_index >= len(data):
-                continue
-
-            csv_row = build_csv_row(
-                original_item=data[row_index],
-                llm_record=results.get(row_index),
-                model=model,
-                timestamp=timestamp,
-                row_index=row_index,
-            )
-
-            writer.writerow(csv_row)
-
-    return len(row_indices)
-
-
-# ============================================================
-# SINGLE RECORD EVALUATION
-# ============================================================
-
-def evaluate_record(
-    row_index: int,
-    user_prompt: str,
-    system_prompt: str,
-    args,
-) -> dict:
-    result = {
-        "row_index": row_index,
-        "llm_result": None,
-        "llm_raw": "",
-        "llm_error": "",
-        "llm_attempts": 0,
-    }
-
-    if not isinstance(user_prompt, str) or not user_prompt.strip():
-        result["llm_error"] = "Пустое поле part_system_prompt."
-        return result
-
-    last_error = None
-
-    for attempt in range(1, MAX_RETRIES + 1):
-        result["llm_attempts"] = attempt
-
-        try:
-            client = get_client(args)
-            raw_response = client.invoke(
-                system_prompt=system_prompt,
-                user_prompt=user_prompt,
-            )
-
-            result["llm_raw"] = raw_response
-            result["llm_result"] = parse_response(raw_response)
-            result["llm_error"] = ""
-            return result
-
-        except Exception as exc:
-            last_error = exc
-            logger.warning(
-                "Объект %s | попытка %s/%s | ошибка: %s",
-                row_index,
-                attempt,
-                MAX_RETRIES,
-                exc,
-            )
-            reset_client()
-
-            if attempt < MAX_RETRIES:
-                delay = RETRY_DELAYS[
-                    min(attempt - 1, len(RETRY_DELAYS) - 1)
-                ]
-                time.sleep(delay)
-
-    result["llm_error"] = str(last_error)
-    return result
-
-
-# ============================================================
-# INPUT VALIDATION
-# ============================================================
-
-def load_input(input_path: Path) -> list[dict]:
     if not input_path.exists():
-        raise FileNotFoundError(f"Файл не найден: {input_path}")
+        raise FileNotFoundError(
+            f"Файл не найден: {input_path}"
+        )
 
-    with input_path.open("r", encoding="utf-8-sig") as file:
+    with input_path.open(
+        "r",
+        encoding="utf-8-sig",
+    ) as file:
         data = json.load(file)
 
     if not isinstance(data, list):
         raise ValueError(
-            "Ожидался JSON-массив объектов на верхнем уровне."
+            "Ожидался JSON-массив объектов."
         )
 
     for index, item in enumerate(data):
@@ -1358,175 +1246,631 @@ def load_input(input_path: Path) -> list[dict]:
     return data
 
 
-
-def validate_input(data: list[dict], input_field: str):
+def validate_input(
+    data: list[dict[str, Any]],
+    input_field: str,
+):
     if not data:
-        raise ValueError("Входной JSON-массив пуст.")
+        raise ValueError(
+            "Входной JSON-массив пуст."
+        )
 
-    missing = [
+    missing_ids = [
         index
         for index, item in enumerate(data)
-        if input_field not in item
+        if (
+            not isinstance(item.get("id"), str)
+            or not item["id"].strip()
+        )
     ]
 
-    if missing:
+    if missing_ids:
         raise ValueError(
-            f"В объектах отсутствует поле '{input_field}'. "
-            f"Примеры индексов: {missing[:10]}"
+            "В объектах отсутствует корректный id. "
+            f"Индексы: {missing_ids[:10]}"
+        )
+
+    duplicate_ids = set()
+    seen_ids = set()
+
+    for item in data:
+        item_id = item["id"]
+
+        if item_id in seen_ids:
+            duplicate_ids.add(item_id)
+
+        seen_ids.add(item_id)
+
+    if duplicate_ids:
+        raise ValueError(
+            "Обнаружены повторяющиеся id во входном файле: "
+            f"{list(duplicate_ids)[:10]}"
         )
 
     missing_gold = [
         index
         for index, item in enumerate(data)
-        if "result" not in item
+        if not isinstance(item.get("result"), list)
     ]
 
     if missing_gold:
         raise ValueError(
-            "Для расчёта метрик в объектах обязательно поле 'result'. "
-            f"Примеры индексов: {missing_gold[:10]}"
+            "В объектах отсутствует корректный список result. "
+            f"Индексы: {missing_gold[:10]}"
+        )
+
+    missing_input = [
+        index
+        for index, item in enumerate(data)
+        if input_field not in item
+    ]
+
+    if missing_input:
+        raise ValueError(
+            f"В объектах отсутствует поле '{input_field}'. "
+            f"Индексы: {missing_input[:10]}"
         )
 
 
 # ============================================================
-# SAVE RESULTS
+# SINGLE RECORD EVALUATION
 # ============================================================
 
-def save_results(
-    data: list[dict],
-    results: dict[int, dict],
+def evaluate_record(
+    row_index: int,
+    user_prompt: str,
+    system_prompt: str,
+    args,
+) -> dict[str, Any]:
+
+    result = {
+        "row_index": row_index,
+        "llm_result": None,
+        "llm_raw": "",
+        "llm_error": "",
+        "llm_attempts": 0,
+    }
+
+    if (
+        not isinstance(user_prompt, str)
+        or not user_prompt.strip()
+    ):
+        result["llm_error"] = (
+            f"Пустое поле {args.input_field}."
+        )
+        return result
+
+    last_error = None
+
+    for attempt in range(1, MAX_RETRIES + 1):
+        result["llm_attempts"] = attempt
+
+        try:
+            client = get_client(args)
+
+            raw_response = client.invoke(
+                system_prompt=system_prompt,
+                user_prompt=user_prompt,
+            )
+
+            result["llm_raw"] = raw_response
+
+            result["llm_result"] = parse_response(
+                raw_response
+            )
+
+            result["llm_error"] = ""
+
+            return result
+
+        except Exception as exc:
+            last_error = exc
+
+            logger.warning(
+                "Объект %s | попытка %s/%s | ошибка: %s",
+                row_index,
+                attempt,
+                MAX_RETRIES,
+                exc,
+            )
+
+            reset_client()
+
+            if attempt < MAX_RETRIES:
+                delay = RETRY_DELAYS[
+                    min(
+                        attempt - 1,
+                        len(RETRY_DELAYS) - 1,
+                    )
+                ]
+
+                time.sleep(delay)
+
+    result["llm_error"] = str(last_error)
+
+    return result
+
+
+# ============================================================
+# RESULT BUILDING
+# ============================================================
+
+def build_result_record(
+    original_item: dict[str, Any],
+    llm_record: dict[str, Any] | None,
+    model: str,
+    timestamp: str,
+    row_index: int,
+) -> dict[str, Any]:
+    """
+    Формирует подробную запись для JSON.
+
+    Если Ground Truth некорректен или LLM завершилась ошибкой,
+    accuracy не рассчитывается. В JSON prediction будет null
+    при ошибке LLM.
+    """
+
+    item_id = original_item["id"]
+
+    gt_names = extract_ground_truth_names(
+        original_item["result"],
+        f"result объекта {item_id}",
+    )
+
+    prediction = None
+
+    if (
+        llm_record is not None
+        and not llm_record.get("llm_error")
+        and llm_record.get("llm_result") is not None
+    ):
+        predicted_names = extract_predicted_names(
+            llm_record["llm_result"],
+            f"prediction объекта {item_id}",
+        )
+
+        prediction = sorted(predicted_names)
+
+    return {
+        "id": item_id,
+        "model": model,
+        "timestamp": timestamp,
+        "gt_ground_truth": sorted(gt_names),
+        "prediction": prediction,
+    }
+
+
+def build_csv_row(
+    original_item: dict[str, Any],
+    llm_record: dict[str, Any] | None,
+    model: str,
+    timestamp: str,
+) -> dict[str, Any]:
+    """
+    CSV содержит одну компактную строку на диалог.
+
+    accuracy:
+        1 — полное совпадение;
+        0 — множества отличаются;
+        пусто — результат невозможно оценить.
+    """
+
+    row = {
+        "timestamp": timestamp,
+        "model": model,
+        "id": original_item["id"],
+        "accuracy": "",
+    }
+
+    try:
+        gt_names = extract_ground_truth_names(
+            original_item["result"],
+            f"result объекта {original_item['id']}",
+        )
+
+    except (ValueError, TypeError) as exc:
+        logger.warning(
+            "ID %s: некорректный Ground Truth: %s",
+            original_item["id"],
+            exc,
+        )
+        return row
+
+    if (
+        llm_record is None
+        or llm_record.get("llm_error")
+        or llm_record.get("llm_result") is None
+    ):
+        return row
+
+    try:
+        predicted_names = extract_predicted_names(
+            llm_record["llm_result"],
+            f"prediction объекта {original_item['id']}",
+        )
+
+        row["accuracy"] = int(
+            gt_names == predicted_names
+        )
+
+    except (ValueError, TypeError) as exc:
+        logger.warning(
+            "ID %s: некорректное предсказание: %s",
+            original_item["id"],
+            exc,
+        )
+
+    return row
+
+
+# ============================================================
+# ATOMIC JSON SAVE
+# ============================================================
+
+def atomic_save_json(
+    data: list[dict[str, Any]],
     output_path: Path,
-    record_metrics: dict[int, dict] | None = None,
 ):
-    """Добавляет результаты LLM, не изменяя исходные поля."""
+    """Атомарная запись JSON через временный файл."""
 
-    output_data = []
+    output_path.parent.mkdir(
+        parents=True,
+        exist_ok=True,
+    )
 
-    for index, original_item in enumerate(data):
-        item = original_item.copy()
-
-        if index in results:
-            result = results[index]
-            item["llm_result"] = result["llm_result"]
-            item["llm_raw"] = result["llm_raw"]
-            item["llm_error"] = result["llm_error"]
-            item["llm_attempts"] = result["llm_attempts"]
-
-        if record_metrics is not None and index in record_metrics:
-            item["name_metrics"] = record_metrics[index]
-
-        output_data.append(item)
-
-    output_path.parent.mkdir(parents=True, exist_ok=True)
     temp_path = output_path.with_name(
         output_path.stem + ".tmp" + output_path.suffix
     )
 
-    with temp_path.open("w", encoding="utf-8") as file:
-        json.dump(
-            output_data,
-            file,
-            ensure_ascii=False,
-            indent=2,
+    try:
+        with temp_path.open(
+            "w",
+            encoding="utf-8",
+        ) as file:
+            json.dump(
+                data,
+                file,
+                ensure_ascii=False,
+                indent=2,
+            )
+
+        temp_path.replace(output_path)
+
+    finally:
+        if temp_path.exists():
+            temp_path.unlink()
+
+
+def append_json_results(
+    records: list[dict[str, Any]],
+    output_path: Path,
+) -> int:
+    """
+    Добавляет подробные результаты в JSON.
+
+    Уникальность записи:
+        id + model + timestamp.
+
+    Существующие результаты других запусков сохраняются.
+    """
+
+    output_path.parent.mkdir(
+        parents=True,
+        exist_ok=True,
+    )
+
+    if output_path.exists():
+        with output_path.open(
+            "r",
+            encoding="utf-8",
+        ) as file:
+            existing = json.load(file)
+
+        if not isinstance(existing, list):
+            raise ValueError(
+                f"Ожидался JSON-массив: {output_path}"
+            )
+
+    else:
+        existing = []
+
+    existing_keys = {
+        (
+            item.get("id"),
+            item.get("model"),
+            item.get("timestamp"),
+        )
+        for item in existing
+        if isinstance(item, dict)
+    }
+
+    added = 0
+
+    for record in records:
+        key = (
+            record["id"],
+            record["model"],
+            record["timestamp"],
         )
 
-    temp_path.replace(output_path)
+        if key in existing_keys:
+            continue
 
+        existing.append(record)
+        existing_keys.add(key)
+        added += 1
 
-def save_metrics(metrics: dict, output_path: Path):
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-
-    with output_path.open("w", encoding="utf-8") as file:
-        json.dump(
-            metrics,
-            file,
-            ensure_ascii=False,
-            indent=2,
+    if added:
+        atomic_save_json(
+            existing,
+            output_path,
         )
+
+    return added
 
 
 # ============================================================
-# LOG METRICS
+# CSV SAVE
 # ============================================================
 
-def log_metrics(metrics: dict):
+def append_csv_results(
+    records: list[dict[str, Any]],
+    output_path: Path,
+) -> int:
+    """Добавляет новые строки в CSV."""
+
+    if not records:
+        return 0
+
+    output_path.parent.mkdir(
+        parents=True,
+        exist_ok=True,
+    )
+
+    file_exists = (
+        output_path.exists()
+        and output_path.stat().st_size > 0
+    )
+
+    with output_path.open(
+        "a",
+        encoding="utf-8-sig",
+        newline="",
+    ) as file:
+
+        writer = csv.DictWriter(
+            file,
+            fieldnames=CSV_FIELDS,
+            extrasaction="ignore",
+        )
+
+        if not file_exists:
+            writer.writeheader()
+
+        writer.writerows(records)
+
+    return len(records)
+
+
+# ============================================================
+# CHECKPOINT
+# ============================================================
+
+def save_checkpoint(
+    data: list[dict[str, Any]],
+    results: dict[int, dict[str, Any]],
+    row_indices: list[int],
+    csv_path: Path,
+    json_path: Path,
+    model: str,
+    timestamp: str,
+) -> tuple[int, int]:
+    """Сохраняет новые результаты в CSV и JSON."""
+
+    csv_records = []
+    json_records = []
+
+    for index in row_indices:
+        original_item = data[index]
+        llm_record = results.get(index)
+
+        csv_records.append(
+            build_csv_row(
+                original_item=original_item,
+                llm_record=llm_record,
+                model=model,
+                timestamp=timestamp,
+            )
+        )
+
+        try:
+            json_records.append(
+                build_result_record(
+                    original_item=original_item,
+                    llm_record=llm_record,
+                    model=model,
+                    timestamp=timestamp,
+                    row_index=index,
+                )
+            )
+
+        except (ValueError, TypeError) as exc:
+            logger.warning(
+                "ID %s: не удалось сформировать JSON-запись: %s",
+                original_item["id"],
+                exc,
+            )
+
+    csv_saved = append_csv_results(
+        records=csv_records,
+        output_path=csv_path,
+    )
+
+    json_saved = append_json_results(
+        records=json_records,
+        output_path=json_path,
+    )
+
+    return csv_saved, json_saved
+
+
+# ============================================================
+# METRICS
+# ============================================================
+
+def calculate_metrics(
+    data: list[dict[str, Any]],
+    results: dict[int, dict[str, Any]],
+) -> dict[str, Any]:
+
+    evaluated = 0
+    correct = 0
+
+    invalid_gold = 0
+    failed = 0
+
+    for index, llm_record in results.items():
+
+        original_item = data[index]
+
+        try:
+            gt_names = extract_ground_truth_names(
+                original_item["result"],
+                f"result объекта {original_item['id']}",
+            )
+
+        except (ValueError, TypeError):
+            invalid_gold += 1
+            continue
+
+        if (
+            llm_record.get("llm_error")
+            or llm_record.get("llm_result") is None
+        ):
+            failed += 1
+            continue
+
+        try:
+            predicted_names = extract_predicted_names(
+                llm_record["llm_result"],
+                f"prediction объекта {original_item['id']}",
+            )
+
+        except (ValueError, TypeError):
+            failed += 1
+            continue
+
+        evaluated += 1
+
+        if gt_names == predicted_names:
+            correct += 1
+
+    accuracy = (
+        correct / evaluated
+        if evaluated
+        else None
+    )
+
+    total_empty = sum(
+        1
+        for result in results.values()
+        if result["llm_attempts"] == 0
+    )
+
+    return {
+        "total_records": len(data),
+        "processed_records": len(results),
+        "evaluated_records": evaluated,
+        "correct_records": correct,
+        "failed_records": failed,
+        "invalid_gold_records": invalid_gold,
+        "empty_input_records": total_empty,
+        "exact_match_accuracy": accuracy,
+    }
+
+
+def log_metrics(metrics: dict[str, Any]):
     logger.info("=" * 70)
-    logger.info("МЕТРИКИ СРАВНЕНИЯ ПО NAME")
+    logger.info("EXACT MATCH ACCURACY")
     logger.info("=" * 70)
 
-    logger.info("Всего объектов: %s", metrics["total_records"])
-    logger.info("Оценено: %s", metrics["evaluated_records"])
-    logger.info("Ошибки LLM: %s", metrics["failed_records"])
     logger.info(
-        "Некорректная эталонная разметка: %s",
+        "Всего объектов: %s",
+        metrics["total_records"],
+    )
+
+    logger.info(
+        "Обработано: %s",
+        metrics["processed_records"],
+    )
+
+    logger.info(
+        "Оценено: %s",
+        metrics["evaluated_records"],
+    )
+
+    logger.info(
+        "Корректных совпадений: %s",
+        metrics["correct_records"],
+    )
+
+    logger.info(
+        "Ошибок LLM: %s",
+        metrics["failed_records"],
+    )
+
+    logger.info(
+        "Некорректная разметка: %s",
         metrics["invalid_gold_records"],
     )
 
     logger.info(
-        "Exact Match Accuracy: %.4f (%s/%s)",
-        metrics["exact_match_accuracy"],
-        metrics["exact_match_correct"],
-        metrics["evaluated_records"],
+        "Без запроса к LLM: %s",
+        metrics["empty_input_records"],
     )
 
-    micro = metrics["micro"]
-    logger.info(
-        "Micro Precision: %.4f | Recall: %.4f | F1: %.4f",
-        micro["precision"],
-        micro["recall"],
-        micro["f1"],
-    )
-    logger.info(
-        "TP: %s | FP: %s | FN: %s",
-        micro["tp"],
-        micro["fp"],
-        micro["fn"],
-    )
+    accuracy = metrics["exact_match_accuracy"]
 
-    logger.info("-" * 70)
-    logger.info("МЕТРИКИ ПО КАЖДОМУ NAME")
-
-    for name, values in metrics["per_name"].items():
+    if accuracy is None:
         logger.info(
-            "%s | P: %.4f | R: %.4f | F1: %.4f "
-            "| TP: %s FP: %s FN: %s",
-            name,
-            values["precision"],
-            values["recall"],
-            values["f1"],
-            values["tp"],
-            values["fp"],
-            values["fn"],
+            "Exact Match Accuracy: N/A"
+        )
+    else:
+        logger.info(
+            "Exact Match Accuracy: %.4f (%s/%s)",
+            accuracy,
+            metrics["correct_records"],
+            metrics["evaluated_records"],
         )
 
     logger.info("=" * 70)
 
 
 # ============================================================
-# MAIN
-# ============================================================
-
-
-# ============================================================
-# MAIN
+# MAIN EVALUATION
 # ============================================================
 
 def run_evaluation(args):
+
     input_path = Path(args.input)
-    output_path = Path(args.output)
+    csv_path = Path(args.output)
+    json_path = Path(args.json_output)
 
     data = load_input(input_path)
-
-    system_prompt = SYSTEM_PROMPT
 
     validate_input(
         data=data,
         input_field=args.input_field,
     )
 
+    # Проверяем наличие системного промпта.
+    if not isinstance(SYSTEM_PROMPT, str) or not SYSTEM_PROMPT.strip():
+        raise ValueError(
+            "SYSTEM_PROMPT не определён или пуст."
+        )
+
     total_rows = len(data)
 
-    # Единое время для всех строк текущего запуска.
     timestamp = datetime.now().astimezone().isoformat(
         timespec="seconds"
     )
@@ -1534,27 +1878,41 @@ def run_evaluation(args):
     logger.info("=" * 70)
     logger.info("ЗАПУСК ОЦЕНКИ")
     logger.info("=" * 70)
+
     logger.info("Входной файл: %s", input_path)
-    logger.info("Выходной CSV: %s", output_path)
+    logger.info("Выходной CSV: %s", csv_path)
+    logger.info("Выходной JSON: %s", json_path)
     logger.info("Количество объектов: %s", total_rows)
     logger.info("Поле для LLM: %s", args.input_field)
     logger.info("Provider: %s", args.provider)
     logger.info("Модель: %s", args.model)
     logger.info("Workers: %s", args.workers)
-    logger.info("Время запуска: %s", timestamp)
+    logger.info("Timestamp: %s", timestamp)
 
-    results: dict[int, dict] = {}
+    results: dict[int, dict[str, Any]] = {}
     futures = {}
 
-    # Индексы, которые уже записаны в CSV.
+    # Индексы, которые уже сохранены в рамках этого запуска.
     written_indices: set[int] = set()
 
-    with ThreadPoolExecutor(max_workers=args.workers) as executor:
+    completed = 0
+    successful = 0
+    failed = 0
+
+    with ThreadPoolExecutor(
+        max_workers=args.workers
+    ) as executor:
 
         for index, item in enumerate(data):
-            user_prompt = item.get(args.input_field)
 
-            if not isinstance(user_prompt, str) or not user_prompt.strip():
+            user_prompt = item.get(
+                args.input_field
+            )
+
+            if (
+                not isinstance(user_prompt, str)
+                or not user_prompt.strip()
+            ):
                 results[index] = {
                     "row_index": index,
                     "llm_result": None,
@@ -1564,23 +1922,24 @@ def run_evaluation(args):
                     ),
                     "llm_attempts": 0,
                 }
+
+                completed += 1
+                failed += 1
+
                 continue
 
             future = executor.submit(
                 evaluate_record,
                 index,
                 user_prompt,
-                system_prompt,
+                SYSTEM_PROMPT,
                 args,
             )
 
             futures[future] = index
 
-        completed = 0
-        successful = 0
-        failed = 0
-
         for future in as_completed(futures):
+
             index = futures[future]
 
             try:
@@ -1610,121 +1969,81 @@ def run_evaluation(args):
                     set(results.keys()) - written_indices
                 )
 
-                saved = append_csv_results(
+                csv_saved, json_saved = save_checkpoint(
                     data=data,
                     results=results,
-                    output_path=output_path,
+                    row_indices=pending_indices,
+                    csv_path=csv_path,
+                    json_path=json_path,
                     model=args.model,
                     timestamp=timestamp,
-                    row_indices=pending_indices,
                 )
 
-                written_indices.update(pending_indices)
+                written_indices.update(
+                    pending_indices
+                )
 
                 logger.info(
                     "Прогресс: %s/%s | Успешно: %s | "
-                    "Ошибки: %s | Сохранено строк: %s",
+                    "Ошибки: %s | CSV: +%s | JSON: +%s",
                     completed,
-                    len(futures),
+                    total_rows,
                     successful,
                     failed,
-                    saved,
+                    csv_saved,
+                    json_saved,
                 )
 
-    # Финально сохраняем все оставшиеся записи.
+    # Финальное сохранение.
+    # Уже сохранённые при checkpoint записи не дублируются.
     pending_indices = sorted(
         set(results.keys()) - written_indices
     )
 
-    saved = append_csv_results(
+    csv_saved, json_saved = save_checkpoint(
         data=data,
         results=results,
-        output_path=output_path,
+        row_indices=pending_indices,
+        csv_path=csv_path,
+        json_path=json_path,
         model=args.model,
         timestamp=timestamp,
-        row_indices=pending_indices,
     )
 
-    written_indices.update(pending_indices)
-
-    # Подсчёт только Exact Match Accuracy.
-    evaluated = 0
-    exact_matches = 0
-
-    for row_index, result in results.items():
-        if (
-            result.get("llm_error")
-            or result.get("llm_result") is None
-        ):
-            continue
-
-        try:
-            gold_names = extract_ground_truth_names(
-                data[row_index].get("result"),
-                f"result объекта {row_index}",
-            )
-
-            predicted_names = extract_predicted_names(
-                result["llm_result"],
-                f"llm_result объекта {row_index}",
-            )
-
-        except (ValueError, TypeError):
-            continue
-
-        evaluated += 1
-
-        if gold_names == predicted_names:
-            exact_matches += 1
-
-    accuracy = (
-        exact_matches / evaluated
-        if evaluated
-        else 0.0
+    written_indices.update(
+        pending_indices
     )
 
-    total_success = sum(
-        1
-        for result in results.values()
-        if not result["llm_error"]
+    metrics = calculate_metrics(
+        data=data,
+        results=results,
     )
 
-    total_failed = sum(
-        1
-        for result in results.values()
-        if result["llm_error"]
+    log_metrics(metrics)
+
+    logger.info(
+        "Добавлено строк в CSV при финальном сохранении: %s",
+        csv_saved,
     )
 
-    total_empty = sum(
-        1
-        for result in results.values()
-        if result["llm_attempts"] == 0
+    logger.info(
+        "Добавлено записей в JSON при финальном сохранении: %s",
+        json_saved,
+    )
+
+    logger.info(
+        "Итоговый CSV: %s",
+        csv_path,
+    )
+
+    logger.info(
+        "Итоговый JSON: %s",
+        json_path,
     )
 
     logger.info("=" * 70)
     logger.info("ОБРАБОТКА ЗАВЕРШЕНА")
-    logger.info("Всего объектов: %s", total_rows)
-    logger.info("Успешно: %s", total_success)
-    logger.info("Ошибки: %s", total_failed)
-    logger.info("Без запроса к LLM: %s", total_empty)
-    logger.info(
-        "Оценено для Accuracy: %s",
-        evaluated,
-    )
-    logger.info(
-        "Exact Match Accuracy: %.4f (%s/%s)",
-        accuracy,
-        exact_matches,
-        evaluated,
-    )
-    logger.info("Добавлено строк в CSV: %s", saved)
-    logger.info("Результат: %s", output_path)
     logger.info("=" * 70)
-
-
-# ============================================================
-# CLI
-# ============================================================
 
 
 # ============================================================
@@ -1732,6 +2051,7 @@ def run_evaluation(args):
 # ============================================================
 
 def parse_args():
+
     parser = argparse.ArgumentParser(
         description=(
             "Многопоточная оценка JSON-диалогов "
@@ -1742,13 +2062,19 @@ def parse_args():
     parser.add_argument(
         "--input",
         required=True,
-        help="Путь к входному JSON.",
+        help="Путь к входному prepared JSON.",
     )
 
     parser.add_argument(
         "--output",
-        default="evaluation_results.csv",
-        help="Путь к выходному CSV.",
+        default="pool_2_prepared.csv",
+        help="Путь к итоговому CSV.",
+    )
+
+    parser.add_argument(
+        "--json-output",
+        default="pool_2_prepared.json",
+        help="Путь к подробному JSON.",
     )
 
     parser.add_argument(
@@ -1791,30 +2117,50 @@ def parse_args():
     args = parser.parse_args()
 
     if args.workers < 1:
-        parser.error("--workers должен быть не меньше 1.")
+        parser.error(
+            "--workers должен быть не меньше 1."
+        )
 
     if not 0 <= args.temperature <= 2:
-        parser.error("--temperature должен быть в диапазоне 0..2.")
+        parser.error(
+            "--temperature должен быть в диапазоне 0..2."
+        )
 
     if not 0 < args.top_p <= 1:
-        parser.error("--top-p должен быть в диапазоне (0, 1].")
+        parser.error(
+            "--top-p должен быть в диапазоне (0, 1]."
+        )
 
     return args
 
 
 if __name__ == "__main__":
+
     arguments = parse_args()
 
     try:
         run_evaluation(arguments)
 
     except KeyboardInterrupt:
-        logger.warning("Обработка прервана пользователем.")
+        logger.warning(
+            "Обработка прервана пользователем."
+        )
 
     except Exception:
-        logger.exception("Критическая ошибка.")
+        logger.exception(
+            "Критическая ошибка."
+        )
         raise
 
+
+
+# python evaluate.py \
+#     --input ./prepared/pool_2_prepared.json \
+#     --output ./results/pool_2_prepared.csv \
+#     --json-output ./results/pool_2_prepared.json \
+#     --provider aihf \
+#     --model DeepSeek-V4.1-Flash \
+#     --workers 5
 
 
 # python evaluate.py \

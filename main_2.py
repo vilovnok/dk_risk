@@ -1,4 +1,4 @@
-
+from pathlib import Path
 import argparse
 import json
 import logging
@@ -16,38 +16,103 @@ logger = logging.getLogger(__name__)
 
 
 def load_json(path: Path) -> list[dict[str, Any]]:
+    """Загружает JSON-массив и проверяет его структуру."""
+
     with path.open("r", encoding="utf-8") as file:
         data = json.load(file)
 
     if not isinstance(data, list):
         raise ValueError(f"Ожидался JSON-массив: {path}")
 
+    for index, item in enumerate(data):
+        if not isinstance(item, dict):
+            raise ValueError(
+                f"Объект с индексом {index} должен быть словарём"
+            )
+
     return data
 
 
-def build_part_system_prompt(item: dict[str, Any]) -> str:
-    """Формирует текстовый контекст из диалога и классов."""
+def normalize_name(value: Any) -> str | None:
+    """Нормализует name, не изменяя его формулировку."""
 
-    dialogue = (
-        item.get("data", {}).get("dialogue", "")
-    )
+    if not isinstance(value, str):
+        return None
 
-    classes = (
-        item.get("premarkup", {}).get("classes", [])
-    )
+    name = " ".join(value.split())
 
-    class_names = [
-        " ".join(str(cls["name"]).split())
-        for cls in classes
-        if isinstance(cls, dict) and cls.get("name")
-    ]
+    if not name:
+        return None
+
+    if name.lower() == "fork":
+        return None
+
+    return name
+
+
+def is_positive_answer(value: Any) -> bool:
+    """Проверяет, является ли ответ положительным."""
+
+    if isinstance(value, bool):
+        return value
+
+    if isinstance(value, (int, float)):
+        return value == 1
+
+    if isinstance(value, str):
+        return value.strip() in {"1", "1.0"}
+
+    return False
+
+
+def extract_unique_class_names(
+    item: dict[str, Any],
+) -> list[str]:
+    """Извлекает уникальные name из premarkup.classes."""
+
+    premarkup = item.get("premarkup") or {}
+    classes = premarkup.get("classes", [])
+
+    if not isinstance(classes, list):
+        return []
+
+    names = []
+    seen = set()
+
+    for cls in classes:
+        if not isinstance(cls, dict):
+            continue
+
+        name = normalize_name(cls.get("name"))
+
+        if name is None or name in seen:
+            continue
+
+        seen.add(name)
+        names.append(name)
+
+    return names
+
+
+def build_part_system_prompt(
+    item: dict[str, Any],
+) -> str:
+    """Формирует текстовый контекст из диалога и уникальных классов."""
+
+    data = item.get("data") or {}
+    dialogue = data.get("dialogue", "")
+
+    if not isinstance(dialogue, str):
+        dialogue = str(dialogue)
+
+    class_names = extract_unique_class_names(item)
 
     variants = "\n".join(
         f"- {name}"
-        for index, name in enumerate(class_names, start=1)
+        for name in class_names
     )
 
-    return f'''**Диалог между сотрудником банка и клиентом**
+    return f"""**Диалог между сотрудником банка и клиентом**
 
 ```
 {dialogue}
@@ -57,37 +122,43 @@ def build_part_system_prompt(item: dict[str, Any]) -> str:
 **Варианты выводов из диалога:**
 
 {variants}
-'''
+"""
 
 
 def extract_positive_results(
     item: dict[str, Any],
 ) -> list[dict[str, str]]:
-    """Оставляет только критерии с answer == 1."""
+    """Оставляет только положительные критерии, исключая fork."""
 
     output_criteria = (
-        item.get("result", {}).get("output_criteria", [])
+        (item.get("result") or {}).get("output_criteria", [])
     )
 
     if not isinstance(output_criteria, list):
         return []
 
     results = []
+    seen = set()
 
     for criterion in output_criteria:
         if not isinstance(criterion, dict):
             continue
 
-        answer = str(criterion.get("answer", "")).strip()
-
-        if answer != "1":
+        if not is_positive_answer(criterion.get("answer")):
             continue
 
+        name = normalize_name(criterion.get("name"))
+
+        if name is None or name in seen:
+            continue
+
+        seen.add(name)
+
         results.append({
-            "name": criterion.get("name", ""),
-            "answer": answer,
-            "comment": criterion.get("comment", ""),
-            "mention": criterion.get("mention", ""),
+            "name": name,
+            "answer": "1",
+            "comment": str(criterion.get("comment") or ""),
+            "mention": str(criterion.get("mention") or ""),
         })
 
     return results
@@ -96,30 +167,37 @@ def extract_positive_results(
 def extract_results(
     item: dict[str, Any],
 ) -> list[dict[str, str]]:
-    """Извлекает все критерии без фильтрации по answer."""
+    """Извлекает все критерии, исключая fork и дублирующиеся name."""
 
     output_criteria = (
-        item.get("result", {}).get("output_criteria", [])
+        (item.get("result") or {}).get("output_criteria", [])
     )
 
     if not isinstance(output_criteria, list):
         return []
 
     results = []
+    seen = set()
 
     for criterion in output_criteria:
         if not isinstance(criterion, dict):
             continue
 
+        name = normalize_name(criterion.get("name"))
+
+        if name is None or name in seen:
+            continue
+
+        seen.add(name)
+
         results.append({
-            "name": criterion.get("name", ""),
+            "name": name,
             "answer": str(criterion.get("answer", "")),
-            "comment": criterion.get("comment", ""),
-            "mention": criterion.get("mention", ""),
+            "comment": str(criterion.get("comment") or ""),
+            "mention": str(criterion.get("mention") or ""),
         })
 
     return results
-
 
 
 def transform_item(
@@ -127,7 +205,10 @@ def transform_item(
 ) -> dict[str, Any]:
     """Преобразует исходный объект в целевую структуру."""
 
+    filename = item.get("filename", "")
+
     return {
+        "id": Path(filename).stem if filename else "",
         "part_system_prompt": build_part_system_prompt(item),
         "result": extract_results(item),
     }
@@ -137,19 +218,59 @@ def process_pool(
     input_path: Path,
     output_path: Path,
 ) -> None:
+    """Обрабатывает один пул и сохраняет подготовленный датасет."""
 
     if not input_path.exists():
-        logger.error("Файл не найден: %s", input_path)
+        logger.warning("Файл не найден, пропускаем: %s", input_path)
         return
 
     logger.info("Обработка файла: %s", input_path)
 
     source_data = load_json(input_path)
 
-    transformed_data = [
-        transform_item(item)
-        for item in source_data
-    ]
+    transformed_data = []
+    total_classes = 0
+    total_results = 0
+    positive_results = 0
+    empty_dialogues = 0
+
+    for index, item in enumerate(source_data):
+        filename = item.get("filename")
+
+        if not isinstance(filename, str) or not filename.strip():
+            logger.warning(
+                "Пропущен объект с индексом %d: отсутствует filename",
+                index,
+            )
+            continue
+
+        item_id = Path(filename).stem
+
+        if not item_id:
+            logger.warning(
+                "Пропущен объект с индексом %d: некорректный filename",
+                index,
+            )
+            continue
+
+        dialogue = (item.get("data") or {}).get("dialogue", "")
+
+        if not isinstance(dialogue, str) or not dialogue.strip():
+            empty_dialogues += 1
+
+        transformed_item = transform_item(item)
+
+        class_names = extract_unique_class_names(item)
+        results = transformed_item["result"]
+
+        total_classes += len(class_names)
+        total_results += len(results)
+        positive_results += sum(
+            result["answer"] == "1"
+            for result in results
+        )
+
+        transformed_data.append(transformed_item)
 
     output_path.parent.mkdir(
         parents=True,
@@ -164,20 +285,21 @@ def process_pool(
             indent=2,
         )
 
-    total_results = sum(
-        len(item["result"])
-        for item in transformed_data
-    )
-
+    logger.info("-" * 60)
     logger.info("Исходных объектов: %d", len(source_data))
     logger.info("Преобразовано объектов: %d", len(transformed_data))
-    logger.info("Положительных результатов: %d", total_results)
+    logger.info("Пропущено объектов: %d", len(source_data) - len(transformed_data))
+    logger.info("Диалогов без текста: %d", empty_dialogues)
+    logger.info("Уникальных классов: %d", total_classes)
+    logger.info("Всего критериев: %d", total_results)
+    logger.info("Положительных критериев: %d", positive_results)
     logger.info("Результат сохранён: %s", output_path)
+    logger.info("-" * 60)
 
 
-def main():
+def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Формирование датасета из объединённых пулов."
+        description="Формирование подготовленных датасетов из объединённых пулов."
     )
 
     parser.add_argument(
