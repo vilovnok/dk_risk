@@ -777,11 +777,13 @@ from tagme_client_advanced import TagmeClientAdvanced
 ENDPOINTS = {
     "direct": "https://tagme.sberdevices.ru/ai/llm/v1/chat/completions",
     "aihf": "https://tagme.sberdevices.ru/x/aihf/llm/v1/chat/completions",
+    "sigma": "https://tagme.sigma.sbrf.ru/ai/llm/v1/chat/completions"
 }
 
 CFG = {
     "direct": "~/configs/.ml_config.cfg",
     "aihf": "~/configs/.ml_config.cfg",
+    "sigma": "~/configs/.ml_config_sigma.cfg",
 }
 
 DEFAULT_MODEL = "DeepSeek-V4.1-Flash"
