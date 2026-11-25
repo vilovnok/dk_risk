@@ -13,6 +13,7 @@ import requests
 from crowd_sdk.tagme import TagmeClientAdvanced
 
 
+
 # ============================================================
 # SYSTEM PROMPT
 # ============================================================
@@ -718,28 +719,55 @@ SYSTEM_PROMPT = """
 
 
 
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
+"""
+Многопоточная оценка диалогов через LLM и сравнение результатов
+с эталонной разметкой исключительно по полю `name`.
+
+Входной JSON:
+[
+  {
+    "part_system_prompt": "...",
+    "result": [{"name": "...", "answer": "0", ...}]
+  }
+]
+
+Сравнение:
+- сравниваются только result[*].name и llm_result[*].name;
+- порядок элементов не важен;
+- пробелы и переносы строк нормализуются;
+- служебный критерий fork игнорируется;
+- mention / answer / comment не используются.
+
+Важно:
+1. Перед запуском укажите корректный импорт TagmeClientAdvanced
+   в блоке IMPORTS, если путь в вашем окружении отличается.
+2. Передайте файл с системным промптом через --system-prompt-file.
+"""
+
+import argparse
+import json
+import logging
 import os
 import re
-import json
-import time
-import logging
-import argparse
 import threading
-
-from pathlib import Path
+import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from pathlib import Path
+from typing import Any
 
 import requests
-from crowd_sdk.tagme import TagmeClientAdvanced
-
+import urllib3
 
 # ============================================================
-# SYSTEM PROMPT
+# IMPORTS
 # ============================================================
 
-SYSTEM_PROMPT = r"""
-ВСТАВЬ СЮДА СВОЙ SYSTEM_PROMPT
-""".strip()
+# При необходимости замените путь импорта на тот, который используется
+# в вашем проекте.
+from tagme_client_advanced import TagmeClientAdvanced
 
 
 # ============================================================
@@ -769,7 +797,12 @@ RETRY_DELAYS = (2, 4)
 INPUT_FIELD = "part_system_prompt"
 CHECKPOINT_EVERY = 10
 
+# Служебные имена, которые не участвуют в сравнении.
+IGNORE_NAMES = {"fork"}
+
 _thread_local = threading.local()
+
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 
 # ============================================================
@@ -781,7 +814,6 @@ logging.basicConfig(
     format="%(asctime)s | %(levelname)s | %(message)s",
     datefmt="%Y-%m-%d %H:%M:%S",
 )
-
 logger = logging.getLogger(__name__)
 
 
@@ -790,7 +822,6 @@ logger = logging.getLogger(__name__)
 # ============================================================
 
 class GigaChatClient:
-
     def __init__(
         self,
         provider: str,
@@ -799,24 +830,19 @@ class GigaChatClient:
         top_p: float,
     ):
         if provider not in ENDPOINTS:
-            raise ValueError(
-                f"Неизвестный provider: {provider}"
-            )
+            raise ValueError(f"Неизвестный provider: {provider}")
 
         self.provider = provider
         self.model = model
         self.temperature = temperature
         self.top_p = top_p
-
         self.url = ENDPOINTS[provider]
-        self.token = self._get_token()
-
         self.session = requests.Session()
+        self.token = self._get_token()
 
     def _get_token(self) -> str:
         config_path = os.path.expanduser(CFG[self.provider])
         client = TagmeClientAdvanced(config_path)
-
         token = client.client.token
 
         if not token:
@@ -826,23 +852,12 @@ class GigaChatClient:
 
         return token
 
-    def invoke(
-        self,
-        system_prompt: str,
-        user_prompt: str,
-    ) -> str:
-
+    def invoke(self, system_prompt: str, user_prompt: str) -> str:
         payload = {
             "model": self.model,
             "messages": [
-                {
-                    "role": "system",
-                    "content": system_prompt,
-                },
-                {
-                    "role": "user",
-                    "content": user_prompt,
-                },
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt},
             ],
             "temperature": self.temperature,
             "top_p": self.top_p,
@@ -865,7 +880,6 @@ class GigaChatClient:
 
         if response.status_code == 401:
             logger.warning("HTTP 401. Обновляю токен.")
-
             self.token = self._get_token()
             headers["Authorization"] = f"Bearer {self.token}"
 
@@ -878,7 +892,6 @@ class GigaChatClient:
             )
 
         response.raise_for_status()
-
         data = response.json()
 
         try:
@@ -906,7 +919,6 @@ class GigaChatClient:
 # ============================================================
 
 def get_client(args):
-
     client = getattr(_thread_local, "client", None)
 
     if client is None:
@@ -916,14 +928,12 @@ def get_client(args):
             temperature=args.temperature,
             top_p=args.top_p,
         )
-
         _thread_local.client = client
 
     return client
 
 
 def reset_client():
-
     client = getattr(_thread_local, "client", None)
 
     if client is not None:
@@ -940,28 +950,21 @@ def reset_client():
 # ============================================================
 
 def extract_json_array(raw_response: str) -> str:
-    """
-    Извлекает JSON-массив из ответа модели.
-    Поддерживает Markdown-обрамление ```json.
-    """
+    """Извлекает JSON-массив из ответа, включая Markdown-обрамление."""
 
     text = raw_response.strip()
-
     text = re.sub(
         r"^\s*```(?:json)?\s*",
         "",
         text,
         flags=re.IGNORECASE,
     )
-
     text = re.sub(r"\s*```\s*$", "", text)
 
     try:
         parsed = json.loads(text)
-
         if isinstance(parsed, list):
             return text
-
     except json.JSONDecodeError:
         pass
 
@@ -981,33 +984,24 @@ def extract_json_array(raw_response: str) -> str:
 
 
 def parse_response(raw_response: str) -> list[dict]:
-
-    json_text = extract_json_array(raw_response)
-    result = json.loads(json_text)
+    result = json.loads(extract_json_array(raw_response))
 
     if not isinstance(result, list):
         raise ValueError("Ответ должен быть JSON-массивом.")
 
     for index, item in enumerate(result):
-
         if not isinstance(item, dict):
-            raise ValueError(
-                f"Элемент {index} должен быть объектом."
-            )
+            raise ValueError(f"Элемент {index} должен быть объектом.")
 
         expected_keys = {"name", "mention"}
-
         if set(item.keys()) != expected_keys:
             raise ValueError(
                 f"Элемент {index}: ожидались только поля "
-                f"{sorted(expected_keys)}, получены "
-                f"{sorted(item.keys())}."
+                f"{sorted(expected_keys)}, получены {sorted(item.keys())}."
             )
 
         if not isinstance(item["name"], str):
-            raise ValueError(
-                f"Элемент {index}: name должен быть строкой."
-            )
+            raise ValueError(f"Элемент {index}: name должен быть строкой.")
 
         if not isinstance(item["mention"], str):
             raise ValueError(
@@ -1015,11 +1009,208 @@ def parse_response(raw_response: str) -> list[dict]:
             )
 
         if not item["name"].strip():
-            raise ValueError(
-                f"Элемент {index}: name не должен быть пустым."
-            )
+            raise ValueError(f"Элемент {index}: name не должен быть пустым.")
 
     return result
+
+
+# ============================================================
+# NAME-BASED METRICS
+# ============================================================
+
+def normalize_name(name: str) -> str:
+    """Нормализует пробелы и переносы строк, не меняя формулировку."""
+    return " ".join(name.split())
+
+
+_NORMALIZED_IGNORE_NAMES = {
+    normalize_name(name).casefold() for name in IGNORE_NAMES
+}
+
+
+def extract_names(items: Any, field_description: str) -> set[str]:
+    """Возвращает множество нормализованных name из списка объектов."""
+
+    if not isinstance(items, list):
+        raise ValueError(f"{field_description}: ожидался список.")
+
+    names = set()
+
+    for index, item in enumerate(items):
+        if not isinstance(item, dict):
+            raise ValueError(
+                f"{field_description}: элемент {index} должен быть объектом."
+            )
+
+        name = item.get("name")
+        if not isinstance(name, str) or not name.strip():
+            raise ValueError(
+                f"{field_description}: элемент {index} "
+                "не содержит корректное поле name."
+            )
+
+        normalized = normalize_name(name)
+
+        if normalized.casefold() in _NORMALIZED_IGNORE_NAMES:
+            continue
+
+        names.add(normalized)
+
+    return names
+
+
+def safe_divide(numerator: int, denominator: int) -> float:
+    return numerator / denominator if denominator else 0.0
+
+
+def calculate_name_metrics(
+    data: list[dict],
+    results: dict[int, dict],
+) -> tuple[dict, dict]:
+    """
+    Сравнивает только множества name.
+
+    Exact Match Accuracy:
+        количество объектов, где gold_names == predicted_names,
+        делённое на количество успешно оценённых объектов.
+
+    Micro Precision / Recall / F1:
+        TP = число совпавших названий;
+        FP = число лишних предсказанных названий;
+        FN = число пропущенных эталонных названий.
+
+    TN не рассчитывается: само по себе отсутствие name в двух списках
+    не даёт надёжного отрицательного примера без отдельной матрицы
+    всех допустимых меток для каждого объекта.
+    """
+
+    evaluated = 0
+    failed = 0
+    invalid_gold = 0
+    exact_matches = 0
+
+    total_tp = 0
+    total_fp = 0
+    total_fn = 0
+
+    per_name: dict[str, dict[str, int]] = {}
+    per_record: dict[int, dict] = {}
+
+    for row_index, original_item in enumerate(data):
+        llm_record = results.get(row_index)
+
+        if (
+            llm_record is None
+            or llm_record.get("llm_error")
+            or llm_record.get("llm_result") is None
+        ):
+            failed += 1
+            continue
+
+        try:
+            gold_names = extract_names(
+                original_item.get("result"),
+                f"result объекта {row_index}",
+            )
+            predicted_names = extract_names(
+                llm_record.get("llm_result"),
+                f"llm_result объекта {row_index}",
+            )
+        except (ValueError, TypeError) as exc:
+            logger.warning(
+                "Объект %s пропущен при расчёте метрик: %s",
+                row_index,
+                exc,
+            )
+            invalid_gold += 1
+            continue
+
+        evaluated += 1
+
+        matched = gold_names & predicted_names
+        missing = gold_names - predicted_names
+        extra = predicted_names - gold_names
+
+        is_exact = gold_names == predicted_names
+        if is_exact:
+            exact_matches += 1
+
+        total_tp += len(matched)
+        total_fn += len(missing)
+        total_fp += len(extra)
+
+        for name in matched:
+            stats = per_name.setdefault(
+                name, {"tp": 0, "fp": 0, "fn": 0}
+            )
+            stats["tp"] += 1
+
+        for name in missing:
+            stats = per_name.setdefault(
+                name, {"tp": 0, "fp": 0, "fn": 0}
+            )
+            stats["fn"] += 1
+
+        for name in extra:
+            stats = per_name.setdefault(
+                name, {"tp": 0, "fp": 0, "fn": 0}
+            )
+            stats["fp"] += 1
+
+        per_record[row_index] = {
+            "exact_match": is_exact,
+            "gold_count": len(gold_names),
+            "predicted_count": len(predicted_names),
+            "matched_count": len(matched),
+            "missing_names": sorted(missing),
+            "extra_names": sorted(extra),
+        }
+
+    precision = safe_divide(total_tp, total_tp + total_fp)
+    recall = safe_divide(total_tp, total_tp + total_fn)
+    f1 = safe_divide(2 * precision * recall, precision + recall)
+
+    exact_accuracy = safe_divide(exact_matches, evaluated)
+
+    per_name_metrics = {}
+    for name, stats in sorted(per_name.items()):
+        name_precision = safe_divide(
+            stats["tp"], stats["tp"] + stats["fp"]
+        )
+        name_recall = safe_divide(
+            stats["tp"], stats["tp"] + stats["fn"]
+        )
+        name_f1 = safe_divide(
+            2 * name_precision * name_recall,
+            name_precision + name_recall,
+        )
+
+        per_name_metrics[name] = {
+            **stats,
+            "precision": round(name_precision, 6),
+            "recall": round(name_recall, 6),
+            "f1": round(name_f1, 6),
+        }
+
+    metrics = {
+        "total_records": len(data),
+        "evaluated_records": evaluated,
+        "failed_records": failed,
+        "invalid_gold_records": invalid_gold,
+        "exact_match_accuracy": round(exact_accuracy, 6),
+        "exact_match_correct": exact_matches,
+        "micro": {
+            "tp": total_tp,
+            "fp": total_fp,
+            "fn": total_fn,
+            "precision": round(precision, 6),
+            "recall": round(recall, 6),
+            "f1": round(f1, 6),
+        },
+        "per_name": per_name_metrics,
+    }
+
+    return metrics, per_record
 
 
 # ============================================================
@@ -1029,9 +1220,9 @@ def parse_response(raw_response: str) -> list[dict]:
 def evaluate_record(
     row_index: int,
     user_prompt: str,
+    system_prompt: str,
     args,
 ) -> dict:
-
     result = {
         "row_index": row_index,
         "llm_result": None,
@@ -1047,30 +1238,22 @@ def evaluate_record(
     last_error = None
 
     for attempt in range(1, MAX_RETRIES + 1):
-
         result["llm_attempts"] = attempt
 
         try:
             client = get_client(args)
-
             raw_response = client.invoke(
-                system_prompt=SYSTEM_PROMPT,
+                system_prompt=system_prompt,
                 user_prompt=user_prompt,
             )
 
             result["llm_raw"] = raw_response
-
-            parsed_result = parse_response(raw_response)
-
-            result["llm_result"] = parsed_result
+            result["llm_result"] = parse_response(raw_response)
             result["llm_error"] = ""
-
             return result
 
         except Exception as exc:
-
             last_error = exc
-
             logger.warning(
                 "Объект %s | попытка %s/%s | ошибка: %s",
                 row_index,
@@ -1078,7 +1261,6 @@ def evaluate_record(
                 MAX_RETRIES,
                 exc,
             )
-
             reset_client()
 
             if attempt < MAX_RETRIES:
@@ -1088,7 +1270,6 @@ def evaluate_record(
                 time.sleep(delay)
 
     result["llm_error"] = str(last_error)
-
     return result
 
 
@@ -1097,11 +1278,8 @@ def evaluate_record(
 # ============================================================
 
 def load_input(input_path: Path) -> list[dict]:
-
     if not input_path.exists():
-        raise FileNotFoundError(
-            f"Файл не найден: {input_path}"
-        )
+        raise FileNotFoundError(f"Файл не найден: {input_path}")
 
     with input_path.open("r", encoding="utf-8-sig") as file:
         data = json.load(file)
@@ -1112,7 +1290,6 @@ def load_input(input_path: Path) -> list[dict]:
         )
 
     for index, item in enumerate(data):
-
         if not isinstance(item, dict):
             raise ValueError(
                 f"Элемент {index} должен быть JSON-объектом."
@@ -1121,18 +1298,22 @@ def load_input(input_path: Path) -> list[dict]:
     return data
 
 
-def validate_input(
-    data: list[dict],
-    input_field: str,
-):
+def load_system_prompt(prompt_path: Path) -> str:
+    if not prompt_path.exists():
+        raise FileNotFoundError(
+            f"Файл системного промпта не найден: {prompt_path}"
+        )
 
+    prompt = prompt_path.read_text(encoding="utf-8-sig").strip()
+    if not prompt:
+        raise ValueError("Файл системного промпта пуст.")
+
+    return prompt
+
+
+def validate_input(data: list[dict], input_field: str):
     if not data:
         raise ValueError("Входной JSON-массив пуст.")
-
-    if not SYSTEM_PROMPT or "ВСТАВЬ СЮДА" in SYSTEM_PROMPT:
-        raise ValueError(
-            "Необходимо вставить system_prompt в SYSTEM_PROMPT."
-        )
 
     missing = [
         index
@@ -1146,6 +1327,18 @@ def validate_input(
             f"Примеры индексов: {missing[:10]}"
         )
 
+    missing_gold = [
+        index
+        for index, item in enumerate(data)
+        if "result" not in item
+    ]
+
+    if missing_gold:
+        raise ValueError(
+            "Для расчёта метрик в объектах обязательно поле 'result'. "
+            f"Примеры индексов: {missing_gold[:10]}"
+        )
+
 
 # ============================================================
 # SAVE RESULTS
@@ -1153,35 +1346,30 @@ def validate_input(
 
 def save_results(
     data: list[dict],
-    results: dict,
+    results: dict[int, dict],
     output_path: Path,
+    record_metrics: dict[int, dict] | None = None,
 ):
-    """
-    Добавляет результаты к исходным объектам.
-    Все остальные поля, включая result, сохраняются.
-    """
+    """Добавляет результаты LLM, не изменяя исходные поля."""
 
     output_data = []
 
     for index, original_item in enumerate(data):
-
         item = original_item.copy()
 
         if index in results:
             result = results[index]
-
             item["llm_result"] = result["llm_result"]
             item["llm_raw"] = result["llm_raw"]
             item["llm_error"] = result["llm_error"]
             item["llm_attempts"] = result["llm_attempts"]
 
+        if record_metrics is not None and index in record_metrics:
+            item["name_metrics"] = record_metrics[index]
+
         output_data.append(item)
 
-    output_path.parent.mkdir(
-        parents=True,
-        exist_ok=True,
-    )
-
+    output_path.parent.mkdir(parents=True, exist_ok=True)
     temp_path = output_path.with_name(
         output_path.stem + ".tmp" + output_path.suffix
     )
@@ -1197,16 +1385,86 @@ def save_results(
     temp_path.replace(output_path)
 
 
+def save_metrics(metrics: dict, output_path: Path):
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+
+    with output_path.open("w", encoding="utf-8") as file:
+        json.dump(
+            metrics,
+            file,
+            ensure_ascii=False,
+            indent=2,
+        )
+
+
+# ============================================================
+# LOG METRICS
+# ============================================================
+
+def log_metrics(metrics: dict):
+    logger.info("=" * 70)
+    logger.info("МЕТРИКИ СРАВНЕНИЯ ПО NAME")
+    logger.info("=" * 70)
+
+    logger.info("Всего объектов: %s", metrics["total_records"])
+    logger.info("Оценено: %s", metrics["evaluated_records"])
+    logger.info("Ошибки LLM: %s", metrics["failed_records"])
+    logger.info(
+        "Некорректная эталонная разметка: %s",
+        metrics["invalid_gold_records"],
+    )
+
+    logger.info(
+        "Exact Match Accuracy: %.4f (%s/%s)",
+        metrics["exact_match_accuracy"],
+        metrics["exact_match_correct"],
+        metrics["evaluated_records"],
+    )
+
+    micro = metrics["micro"]
+    logger.info(
+        "Micro Precision: %.4f | Recall: %.4f | F1: %.4f",
+        micro["precision"],
+        micro["recall"],
+        micro["f1"],
+    )
+    logger.info(
+        "TP: %s | FP: %s | FN: %s",
+        micro["tp"],
+        micro["fp"],
+        micro["fn"],
+    )
+
+    logger.info("-" * 70)
+    logger.info("МЕТРИКИ ПО КАЖДОМУ NAME")
+
+    for name, values in metrics["per_name"].items():
+        logger.info(
+            "%s | P: %.4f | R: %.4f | F1: %.4f "
+            "| TP: %s FP: %s FN: %s",
+            name,
+            values["precision"],
+            values["recall"],
+            values["f1"],
+            values["tp"],
+            values["fp"],
+            values["fn"],
+        )
+
+    logger.info("=" * 70)
+
+
 # ============================================================
 # MAIN
 # ============================================================
 
 def run_evaluation(args):
-
     input_path = Path(args.input)
     output_path = Path(args.output)
+    prompt_path = Path(args.system_prompt_file)
 
     data = load_input(input_path)
+    system_prompt = load_system_prompt(prompt_path)
 
     validate_input(
         data=data,
@@ -1217,42 +1475,39 @@ def run_evaluation(args):
 
     logger.info("Входной файл: %s", input_path)
     logger.info("Выходной файл: %s", output_path)
+    logger.info("Системный промпт: %s", prompt_path)
     logger.info("Количество объектов: %s", total_rows)
     logger.info("Поле для LLM: %s", args.input_field)
     logger.info("Provider: %s", args.provider)
     logger.info("Модель: %s", args.model)
     logger.info("Workers: %s", args.workers)
 
-    results = {}
+    results: dict[int, dict] = {}
     futures = {}
 
-    with ThreadPoolExecutor(
-        max_workers=args.workers
-    ) as executor:
-
+    with ThreadPoolExecutor(max_workers=args.workers) as executor:
         for index, item in enumerate(data):
-
             user_prompt = item.get(args.input_field)
 
             if not isinstance(user_prompt, str) or not user_prompt.strip():
-
                 results[index] = {
                     "row_index": index,
                     "llm_result": None,
                     "llm_raw": "",
-                    "llm_error": "Пустое поле part_system_prompt.",
+                    "llm_error": (
+                        f"Пустое поле {args.input_field}."
+                    ),
                     "llm_attempts": 0,
                 }
-
                 continue
 
             future = executor.submit(
                 evaluate_record,
                 index,
                 user_prompt,
+                system_prompt,
                 args,
             )
-
             futures[future] = index
 
         completed = 0
@@ -1260,12 +1515,10 @@ def run_evaluation(args):
         failed = 0
 
         for future in as_completed(futures):
-
             index = futures[future]
 
             try:
                 result = future.result()
-
             except Exception as exc:
                 result = {
                     "row_index": index,
@@ -1284,7 +1537,6 @@ def run_evaluation(args):
                 successful += 1
 
             if completed % CHECKPOINT_EVERY == 0:
-
                 save_results(
                     data=data,
                     results=results,
@@ -1299,36 +1551,48 @@ def run_evaluation(args):
                     failed,
                 )
 
-    # Финальное сохранение.
+    # Рассчитываем метрики после завершения всех запросов.
+    metrics, record_metrics = calculate_name_metrics(
+        data=data,
+        results=results,
+    )
+
+    # Финальное сохранение результатов с метриками по каждому объекту.
     save_results(
         data=data,
         results=results,
         output_path=output_path,
+        record_metrics=record_metrics,
     )
+
+    metrics_path = output_path.with_name(
+        output_path.stem + "_metrics.json"
+    )
+    save_metrics(metrics, metrics_path)
+    log_metrics(metrics)
 
     total_success = sum(
         1 for result in results.values()
         if not result["llm_error"]
     )
-
     total_failed = sum(
         1 for result in results.values()
         if result["llm_error"]
     )
-
     total_empty = sum(
         1 for result in results.values()
         if result["llm_attempts"] == 0
     )
 
-    logger.info("=" * 60)
+    logger.info("=" * 70)
     logger.info("ОБРАБОТКА ЗАВЕРШЕНА")
     logger.info("Всего объектов: %s", total_rows)
     logger.info("Успешно: %s", total_success)
     logger.info("Ошибки: %s", total_failed)
     logger.info("Без запроса к LLM: %s", total_empty)
     logger.info("Результат: %s", output_path)
-    logger.info("=" * 60)
+    logger.info("Метрики: %s", metrics_path)
+    logger.info("=" * 70)
 
 
 # ============================================================
@@ -1336,9 +1600,11 @@ def run_evaluation(args):
 # ============================================================
 
 def parse_args():
-
     parser = argparse.ArgumentParser(
-        description="Многопоточная оценка JSON-диалогов."
+        description=(
+            "Многопоточная оценка JSON-диалогов "
+            "с расчётом метрик сравнения name."
+        )
     )
 
     parser.add_argument(
@@ -1346,19 +1612,21 @@ def parse_args():
         required=True,
         help="Путь к входному JSON.",
     )
-
     parser.add_argument(
         "--output",
         default="results.json",
         help="Путь к выходному JSON.",
     )
-
     parser.add_argument(
         "--input-field",
         default=INPUT_FIELD,
         help="Поле JSON с текстом для LLM.",
     )
-
+    parser.add_argument(
+        "--system-prompt-file",
+        required=True,
+        help="Путь к TXT-файлу с системным промптом.",
+    )
     parser.add_argument(
         "-w",
         "--workers",
@@ -1366,24 +1634,20 @@ def parse_args():
         default=5,
         help="Количество потоков.",
     )
-
     parser.add_argument(
         "--provider",
         choices=["aihf", "direct"],
         default="aihf",
     )
-
     parser.add_argument(
         "--model",
         default=DEFAULT_MODEL,
     )
-
     parser.add_argument(
         "--temperature",
         type=float,
         default=DEFAULT_TEMPERATURE,
     )
-
     parser.add_argument(
         "--top-p",
         type=float,
@@ -1405,15 +1669,12 @@ def parse_args():
 
 
 if __name__ == "__main__":
-
     arguments = parse_args()
 
     try:
         run_evaluation(arguments)
-
     except KeyboardInterrupt:
         logger.warning("Обработка прервана пользователем.")
-
     except Exception:
         logger.exception("Критическая ошибка.")
         raise
