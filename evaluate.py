@@ -1011,8 +1011,20 @@ def parse_response(raw_response: str) -> list[dict]:
 # NAME-BASED METRICS
 # ============================================================
 
+
+def is_positive_answer(answer: Any) -> bool:
+    """Проверяет, является ли answer положительным."""
+    if isinstance(answer, bool):
+        return answer is True
+    if isinstance(answer, (int, float)):
+        return answer == 1
+    if isinstance(answer, str):
+        return answer.strip() in {"1", "1.0"}
+    return False
+
+
 def normalize_name(name: str) -> str:
-    """Нормализует пробелы и переносы строк, не меняя формулировку."""
+    """Нормализует пробелы и переносы строк."""
     return " ".join(name.split())
 
 
@@ -1021,9 +1033,25 @@ _NORMALIZED_IGNORE_NAMES = {
 }
 
 
-def extract_names(items: Any, field_description: str) -> set[str]:
-    """Возвращает множество нормализованных name из списка объектов."""
+def normalize_and_filter_name(name: Any, context: str) -> str | None:
+    if not isinstance(name, str) or not name.strip():
+        raise ValueError(f"{context}: некорректное поле name.")
 
+    normalized = normalize_name(name)
+
+    if normalized.casefold() in _NORMALIZED_IGNORE_NAMES:
+        return None
+
+    return normalized
+
+
+def extract_ground_truth_names(
+    items: Any,
+    field_description: str,
+) -> set[str]:
+    """
+    Ground Truth формируется только из объектов с answer == 1.
+    """
     if not isinstance(items, list):
         raise ValueError(f"{field_description}: ожидался список.")
 
@@ -1035,19 +1063,46 @@ def extract_names(items: Any, field_description: str) -> set[str]:
                 f"{field_description}: элемент {index} должен быть объектом."
             )
 
-        name = item.get("name")
-        if not isinstance(name, str) or not name.strip():
-            raise ValueError(
-                f"{field_description}: элемент {index} "
-                "не содержит корректное поле name."
-            )
-
-        normalized = normalize_name(name)
-
-        if normalized.casefold() in _NORMALIZED_IGNORE_NAMES:
+        if not is_positive_answer(item.get("answer")):
             continue
 
-        names.add(normalized)
+        name = normalize_and_filter_name(
+            item.get("name"),
+            f"{field_description}, элемент {index}",
+        )
+
+        if name is not None:
+            names.add(name)
+
+    return names
+
+
+def extract_predicted_names(
+    items: Any,
+    field_description: str,
+) -> set[str]:
+    """
+    Из ответа LLM извлекаются все name.
+    mention не участвует в сравнении.
+    """
+    if not isinstance(items, list):
+        raise ValueError(f"{field_description}: ожидался список.")
+
+    names = set()
+
+    for index, item in enumerate(items):
+        if not isinstance(item, dict):
+            raise ValueError(
+                f"{field_description}: элемент {index} должен быть объектом."
+            )
+
+        name = normalize_and_filter_name(
+            item.get("name"),
+            f"{field_description}, элемент {index}",
+        )
+
+        if name is not None:
+            names.add(name)
 
     return names
 
@@ -1060,22 +1115,6 @@ def calculate_name_metrics(
     data: list[dict],
     results: dict[int, dict],
 ) -> tuple[dict, dict]:
-    """
-    Сравнивает только множества name.
-
-    Exact Match Accuracy:
-        количество объектов, где gold_names == predicted_names,
-        делённое на количество успешно оценённых объектов.
-
-    Micro Precision / Recall / F1:
-        TP = число совпавших названий;
-        FP = число лишних предсказанных названий;
-        FN = число пропущенных эталонных названий.
-
-    TN не рассчитывается: само по себе отсутствие name в двух списках
-    не даёт надёжного отрицательного примера без отдельной матрицы
-    всех допустимых меток для каждого объекта.
-    """
 
     evaluated = 0
     failed = 0
@@ -1101,14 +1140,18 @@ def calculate_name_metrics(
             continue
 
         try:
-            gold_names = extract_names(
+            # Эталон: только answer == 1.
+            gold_names = extract_ground_truth_names(
                 original_item.get("result"),
                 f"result объекта {row_index}",
             )
-            predicted_names = extract_names(
+
+            # Предсказание: все name, возвращённые моделью.
+            predicted_names = extract_predicted_names(
                 llm_record.get("llm_result"),
                 f"llm_result объекта {row_index}",
             )
+
         except (ValueError, TypeError) as exc:
             logger.warning(
                 "Объект %s пропущен при расчёте метрик: %s",
@@ -1125,6 +1168,7 @@ def calculate_name_metrics(
         extra = predicted_names - gold_names
 
         is_exact = gold_names == predicted_names
+
         if is_exact:
             exact_matches += 1
 
@@ -1152,26 +1196,37 @@ def calculate_name_metrics(
 
         per_record[row_index] = {
             "exact_match": is_exact,
-            "gold_count": len(gold_names),
+            "ground_truth_count": len(gold_names),
             "predicted_count": len(predicted_names),
-            "matched_count": len(matched),
+            "tp": len(matched),
+            "fp": len(extra),
+            "fn": len(missing),
+            "ground_truth_names": sorted(gold_names),
+            "predicted_names": sorted(predicted_names),
+            "matched_names": sorted(matched),
             "missing_names": sorted(missing),
             "extra_names": sorted(extra),
         }
 
     precision = safe_divide(total_tp, total_tp + total_fp)
     recall = safe_divide(total_tp, total_tp + total_fn)
-    f1 = safe_divide(2 * precision * recall, precision + recall)
+    f1 = safe_divide(
+        2 * precision * recall,
+        precision + recall,
+    )
 
     exact_accuracy = safe_divide(exact_matches, evaluated)
 
     per_name_metrics = {}
+
     for name, stats in sorted(per_name.items()):
         name_precision = safe_divide(
-            stats["tp"], stats["tp"] + stats["fp"]
+            stats["tp"],
+            stats["tp"] + stats["fp"],
         )
         name_recall = safe_divide(
-            stats["tp"], stats["tp"] + stats["fn"]
+            stats["tp"],
+            stats["tp"] + stats["fn"],
         )
         name_f1 = safe_divide(
             2 * name_precision * name_recall,
@@ -1204,7 +1259,6 @@ def calculate_name_metrics(
     }
 
     return metrics, per_record
-
 
 # ============================================================
 # SINGLE RECORD EVALUATION
