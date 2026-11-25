@@ -747,29 +747,6 @@ SYSTEM_PROMPT = """
 2. Передайте файл с системным промптом через --system-prompt-file.
 """
 
-import argparse
-import json
-import logging
-import os
-import re
-import threading
-import time
-from concurrent.futures import ThreadPoolExecutor, as_completed
-from pathlib import Path
-from typing import Any
-
-import requests
-import urllib3
-
-# ============================================================
-# IMPORTS
-# ============================================================
-
-# При необходимости замените путь импорта на тот, который используется
-# в вашем проекте.
-from tagme_client_advanced import TagmeClientAdvanced
-
-
 # ============================================================
 # CONFIG
 # ============================================================
