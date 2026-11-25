@@ -1604,11 +1604,6 @@ def parse_args():
         help="Поле JSON с текстом для LLM.",
     )
     parser.add_argument(
-        "--system-prompt-file",
-        required=True,
-        help="Путь к TXT-файлу с системным промптом.",
-    )
-    parser.add_argument(
         "-w",
         "--workers",
         type=int,
