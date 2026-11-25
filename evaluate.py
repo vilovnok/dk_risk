@@ -1,3 +1,5 @@
+import csv
+from datetime import datetime
 import os
 import re
 import json
@@ -1012,14 +1014,22 @@ def parse_response(raw_response: str) -> list[dict]:
 # ============================================================
 
 
+
+# ============================================================
+# NAME EXTRACTION
+# ============================================================
+
 def is_positive_answer(answer: Any) -> bool:
     """Проверяет, является ли answer положительным."""
     if isinstance(answer, bool):
         return answer is True
+
     if isinstance(answer, (int, float)):
         return answer == 1
+
     if isinstance(answer, str):
         return answer.strip() in {"1", "1.0"}
+
     return False
 
 
@@ -1028,12 +1038,17 @@ def normalize_name(name: str) -> str:
     return " ".join(name.split())
 
 
+# Служебные категории, исключаемые из сравнения.
 _NORMALIZED_IGNORE_NAMES = {
-    normalize_name(name).casefold() for name in IGNORE_NAMES
+    normalize_name(name).casefold()
+    for name in IGNORE_NAMES
 }
 
 
-def normalize_and_filter_name(name: Any, context: str) -> str | None:
+def normalize_and_filter_name(
+    name: Any,
+    context: str,
+) -> str | None:
     if not isinstance(name, str) or not name.strip():
         raise ValueError(f"{context}: некорректное поле name.")
 
@@ -1063,6 +1078,7 @@ def extract_ground_truth_names(
                 f"{field_description}: элемент {index} должен быть объектом."
             )
 
+        # В Ground Truth включаем только положительные категории.
         if not is_positive_answer(item.get("answer")):
             continue
 
@@ -1107,158 +1123,155 @@ def extract_predicted_names(
     return names
 
 
-def safe_divide(numerator: int, denominator: int) -> float:
-    return numerator / denominator if denominator else 0.0
+# ============================================================
+# CSV RESULTS
+# ============================================================
+
+CSV_FIELDS = [
+    "model",
+    "timestamp",
+    "accuracy",
+    "gt_ground_truth",
+    "prediction",
+]
 
 
-def calculate_name_metrics(
-    data: list[dict],
-    results: dict[int, dict],
-) -> tuple[dict, dict]:
+def build_csv_row(
+    original_item: dict,
+    llm_record: dict | None,
+    model: str,
+    timestamp: str,
+    row_index: int,
+) -> dict:
+    """
+    Формирует CSV-строку для одного диалога.
 
-    evaluated = 0
-    failed = 0
-    invalid_gold = 0
-    exact_matches = 0
+    accuracy:
+        1 — полное совпадение множеств GT и Prediction;
+        0 — множества отличаются;
+        пустое значение — невозможно оценить результат.
+    """
 
-    total_tp = 0
-    total_fp = 0
-    total_fn = 0
-
-    per_name: dict[str, dict[str, int]] = {}
-    per_record: dict[int, dict] = {}
-
-    for row_index, original_item in enumerate(data):
-        llm_record = results.get(row_index)
-
-        if (
-            llm_record is None
-            or llm_record.get("llm_error")
-            or llm_record.get("llm_result") is None
-        ):
-            failed += 1
-            continue
-
-        try:
-            # Эталон: только answer == 1.
-            gold_names = extract_ground_truth_names(
-                original_item.get("result"),
-                f"result объекта {row_index}",
-            )
-
-            # Предсказание: все name, возвращённые моделью.
-            predicted_names = extract_predicted_names(
-                llm_record.get("llm_result"),
-                f"llm_result объекта {row_index}",
-            )
-
-        except (ValueError, TypeError) as exc:
-            logger.warning(
-                "Объект %s пропущен при расчёте метрик: %s",
-                row_index,
-                exc,
-            )
-            invalid_gold += 1
-            continue
-
-        evaluated += 1
-
-        matched = gold_names & predicted_names
-        missing = gold_names - predicted_names
-        extra = predicted_names - gold_names
-
-        is_exact = gold_names == predicted_names
-
-        if is_exact:
-            exact_matches += 1
-
-        total_tp += len(matched)
-        total_fn += len(missing)
-        total_fp += len(extra)
-
-        for name in matched:
-            stats = per_name.setdefault(
-                name, {"tp": 0, "fp": 0, "fn": 0}
-            )
-            stats["tp"] += 1
-
-        for name in missing:
-            stats = per_name.setdefault(
-                name, {"tp": 0, "fp": 0, "fn": 0}
-            )
-            stats["fn"] += 1
-
-        for name in extra:
-            stats = per_name.setdefault(
-                name, {"tp": 0, "fp": 0, "fn": 0}
-            )
-            stats["fp"] += 1
-
-        per_record[row_index] = {
-            "exact_match": is_exact,
-            "ground_truth_count": len(gold_names),
-            "predicted_count": len(predicted_names),
-            "tp": len(matched),
-            "fp": len(extra),
-            "fn": len(missing),
-            "ground_truth_names": sorted(gold_names),
-            "predicted_names": sorted(predicted_names),
-            "matched_names": sorted(matched),
-            "missing_names": sorted(missing),
-            "extra_names": sorted(extra),
-        }
-
-    precision = safe_divide(total_tp, total_tp + total_fp)
-    recall = safe_divide(total_tp, total_tp + total_fn)
-    f1 = safe_divide(
-        2 * precision * recall,
-        precision + recall,
-    )
-
-    exact_accuracy = safe_divide(exact_matches, evaluated)
-
-    per_name_metrics = {}
-
-    for name, stats in sorted(per_name.items()):
-        name_precision = safe_divide(
-            stats["tp"],
-            stats["tp"] + stats["fp"],
-        )
-        name_recall = safe_divide(
-            stats["tp"],
-            stats["tp"] + stats["fn"],
-        )
-        name_f1 = safe_divide(
-            2 * name_precision * name_recall,
-            name_precision + name_recall,
-        )
-
-        per_name_metrics[name] = {
-            **stats,
-            "precision": round(name_precision, 6),
-            "recall": round(name_recall, 6),
-            "f1": round(name_f1, 6),
-        }
-
-    metrics = {
-        "total_records": len(data),
-        "evaluated_records": evaluated,
-        "failed_records": failed,
-        "invalid_gold_records": invalid_gold,
-        "exact_match_accuracy": round(exact_accuracy, 6),
-        "exact_match_correct": exact_matches,
-        "micro": {
-            "tp": total_tp,
-            "fp": total_fp,
-            "fn": total_fn,
-            "precision": round(precision, 6),
-            "recall": round(recall, 6),
-            "f1": round(f1, 6),
-        },
-        "per_name": per_name_metrics,
+    row = {
+        "model": model,
+        "timestamp": timestamp,
+        "accuracy": "",
+        "gt_ground_truth": "",
+        "prediction": "",
     }
 
-    return metrics, per_record
+    # Извлекаем Ground Truth независимо от результата инференса.
+    try:
+        gold_names = extract_ground_truth_names(
+            original_item.get("result"),
+            f"result объекта {row_index}",
+        )
+
+        row["gt_ground_truth"] = json.dumps(
+            sorted(gold_names),
+            ensure_ascii=False,
+        )
+
+    except (ValueError, TypeError) as exc:
+        logger.warning(
+            "Объект %s: некорректный Ground Truth: %s",
+            row_index,
+            exc,
+        )
+        return row
+
+    # Если LLM завершилась ошибкой, accuracy не рассчитываем.
+    if (
+        llm_record is None
+        or llm_record.get("llm_error")
+        or llm_record.get("llm_result") is None
+    ):
+        return row
+
+    try:
+        predicted_names = extract_predicted_names(
+            llm_record["llm_result"],
+            f"llm_result объекта {row_index}",
+        )
+
+        row["prediction"] = json.dumps(
+            sorted(predicted_names),
+            ensure_ascii=False,
+        )
+
+        # Exact Match Accuracy для отдельного диалога.
+        row["accuracy"] = int(gold_names == predicted_names)
+
+    except (ValueError, TypeError) as exc:
+        logger.warning(
+            "Объект %s: некорректное предсказание: %s",
+            row_index,
+            exc,
+        )
+
+    return row
+
+
+def append_csv_results(
+    data: list[dict],
+    results: dict[int, dict],
+    output_path: Path,
+    model: str,
+    timestamp: str,
+    row_indices: list[int] | None = None,
+) -> int:
+    """
+    Добавляет результаты в CSV.
+
+    Если файл уже существует, новые строки добавляются в конец.
+    Заголовок создаётся только при первом сохранении.
+
+    Возвращает количество добавленных строк.
+    """
+
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+
+    if row_indices is None:
+        row_indices = sorted(results.keys())
+
+    if not row_indices:
+        return 0
+
+    file_exists = (
+        output_path.exists()
+        and output_path.stat().st_size > 0
+    )
+
+    with output_path.open(
+        "a",
+        encoding="utf-8-sig",
+        newline="",
+    ) as file:
+        writer = csv.DictWriter(
+            file,
+            fieldnames=CSV_FIELDS,
+            extrasaction="ignore",
+        )
+
+        if not file_exists:
+            writer.writeheader()
+
+        for row_index in row_indices:
+            if row_index < 0 or row_index >= len(data):
+                continue
+
+            csv_row = build_csv_row(
+                original_item=data[row_index],
+                llm_record=results.get(row_index),
+                model=model,
+                timestamp=timestamp,
+                row_index=row_index,
+            )
+
+            writer.writerow(csv_row)
+
+    return len(row_indices)
+
 
 # ============================================================
 # SINGLE RECORD EVALUATION
@@ -1493,11 +1506,17 @@ def log_metrics(metrics: dict):
 # MAIN
 # ============================================================
 
+
+# ============================================================
+# MAIN
+# ============================================================
+
 def run_evaluation(args):
     input_path = Path(args.input)
     output_path = Path(args.output)
 
     data = load_input(input_path)
+
     system_prompt = SYSTEM_PROMPT
 
     validate_input(
@@ -1507,18 +1526,31 @@ def run_evaluation(args):
 
     total_rows = len(data)
 
+    # Единое время для всех строк текущего запуска.
+    timestamp = datetime.now().astimezone().isoformat(
+        timespec="seconds"
+    )
+
+    logger.info("=" * 70)
+    logger.info("ЗАПУСК ОЦЕНКИ")
+    logger.info("=" * 70)
     logger.info("Входной файл: %s", input_path)
-    logger.info("Выходной файл: %s", output_path)
+    logger.info("Выходной CSV: %s", output_path)
     logger.info("Количество объектов: %s", total_rows)
     logger.info("Поле для LLM: %s", args.input_field)
     logger.info("Provider: %s", args.provider)
     logger.info("Модель: %s", args.model)
     logger.info("Workers: %s", args.workers)
+    logger.info("Время запуска: %s", timestamp)
 
     results: dict[int, dict] = {}
     futures = {}
 
+    # Индексы, которые уже записаны в CSV.
+    written_indices: set[int] = set()
+
     with ThreadPoolExecutor(max_workers=args.workers) as executor:
+
         for index, item in enumerate(data):
             user_prompt = item.get(args.input_field)
 
@@ -1541,6 +1573,7 @@ def run_evaluation(args):
                 system_prompt,
                 args,
             )
+
             futures[future] = index
 
         completed = 0
@@ -1552,6 +1585,7 @@ def run_evaluation(args):
 
             try:
                 result = future.result()
+
             except Exception as exc:
                 result = {
                     "row_index": index,
@@ -1569,51 +1603,101 @@ def run_evaluation(args):
             else:
                 successful += 1
 
+            # Контрольное сохранение.
             if completed % CHECKPOINT_EVERY == 0:
-                save_results(
+
+                pending_indices = sorted(
+                    set(results.keys()) - written_indices
+                )
+
+                saved = append_csv_results(
                     data=data,
                     results=results,
                     output_path=output_path,
+                    model=args.model,
+                    timestamp=timestamp,
+                    row_indices=pending_indices,
                 )
 
+                written_indices.update(pending_indices)
+
                 logger.info(
-                    "Прогресс: %s/%s | Успешно: %s | Ошибки: %s",
+                    "Прогресс: %s/%s | Успешно: %s | "
+                    "Ошибки: %s | Сохранено строк: %s",
                     completed,
                     len(futures),
                     successful,
                     failed,
+                    saved,
                 )
 
-    # Рассчитываем метрики после завершения всех запросов.
-    metrics, record_metrics = calculate_name_metrics(
-        data=data,
-        results=results,
+    # Финально сохраняем все оставшиеся записи.
+    pending_indices = sorted(
+        set(results.keys()) - written_indices
     )
 
-    # Финальное сохранение результатов с метриками по каждому объекту.
-    save_results(
+    saved = append_csv_results(
         data=data,
         results=results,
         output_path=output_path,
-        record_metrics=record_metrics,
+        model=args.model,
+        timestamp=timestamp,
+        row_indices=pending_indices,
     )
 
-    metrics_path = output_path.with_name(
-        output_path.stem + "_metrics.json"
+    written_indices.update(pending_indices)
+
+    # Подсчёт только Exact Match Accuracy.
+    evaluated = 0
+    exact_matches = 0
+
+    for row_index, result in results.items():
+        if (
+            result.get("llm_error")
+            or result.get("llm_result") is None
+        ):
+            continue
+
+        try:
+            gold_names = extract_ground_truth_names(
+                data[row_index].get("result"),
+                f"result объекта {row_index}",
+            )
+
+            predicted_names = extract_predicted_names(
+                result["llm_result"],
+                f"llm_result объекта {row_index}",
+            )
+
+        except (ValueError, TypeError):
+            continue
+
+        evaluated += 1
+
+        if gold_names == predicted_names:
+            exact_matches += 1
+
+    accuracy = (
+        exact_matches / evaluated
+        if evaluated
+        else 0.0
     )
-    save_metrics(metrics, metrics_path)
-    log_metrics(metrics)
 
     total_success = sum(
-        1 for result in results.values()
+        1
+        for result in results.values()
         if not result["llm_error"]
     )
+
     total_failed = sum(
-        1 for result in results.values()
+        1
+        for result in results.values()
         if result["llm_error"]
     )
+
     total_empty = sum(
-        1 for result in results.values()
+        1
+        for result in results.values()
         if result["llm_attempts"] == 0
     )
 
@@ -1623,9 +1707,24 @@ def run_evaluation(args):
     logger.info("Успешно: %s", total_success)
     logger.info("Ошибки: %s", total_failed)
     logger.info("Без запроса к LLM: %s", total_empty)
+    logger.info(
+        "Оценено для Accuracy: %s",
+        evaluated,
+    )
+    logger.info(
+        "Exact Match Accuracy: %.4f (%s/%s)",
+        accuracy,
+        exact_matches,
+        evaluated,
+    )
+    logger.info("Добавлено строк в CSV: %s", saved)
     logger.info("Результат: %s", output_path)
-    logger.info("Метрики: %s", metrics_path)
     logger.info("=" * 70)
+
+
+# ============================================================
+# CLI
+# ============================================================
 
 
 # ============================================================
@@ -1636,7 +1735,7 @@ def parse_args():
     parser = argparse.ArgumentParser(
         description=(
             "Многопоточная оценка JSON-диалогов "
-            "с расчётом метрик сравнения name."
+            "с расчётом Exact Match Accuracy."
         )
     )
 
@@ -1645,16 +1744,19 @@ def parse_args():
         required=True,
         help="Путь к входному JSON.",
     )
+
     parser.add_argument(
         "--output",
-        default="results.json",
-        help="Путь к выходному JSON.",
+        default="evaluation_results.csv",
+        help="Путь к выходному CSV.",
     )
+
     parser.add_argument(
         "--input-field",
         default=INPUT_FIELD,
         help="Поле JSON с текстом для LLM.",
     )
+
     parser.add_argument(
         "-w",
         "--workers",
@@ -1662,20 +1764,24 @@ def parse_args():
         default=5,
         help="Количество потоков.",
     )
+
     parser.add_argument(
         "--provider",
         choices=["aihf", "direct", "sigma"],
         default="aihf",
     )
+
     parser.add_argument(
         "--model",
         default=DEFAULT_MODEL,
     )
+
     parser.add_argument(
         "--temperature",
         type=float,
         default=DEFAULT_TEMPERATURE,
     )
+
     parser.add_argument(
         "--top-p",
         type=float,
@@ -1701,11 +1807,14 @@ if __name__ == "__main__":
 
     try:
         run_evaluation(arguments)
+
     except KeyboardInterrupt:
         logger.warning("Обработка прервана пользователем.")
+
     except Exception:
         logger.exception("Критическая ошибка.")
         raise
+
 
 
 # python evaluate.py \
