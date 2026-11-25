@@ -115,15 +115,10 @@ def build_part_system_prompt(
     return f"""
 ## Диалог между сотрудником банка и клиентом
 
-```
+
 {dialogue}
-```
 
-
-Доступные варианты критериев клиента, которые нужно выбрать для диалога:
-
-{variants}
-"""
+""".strip()
 
 
 def extract_positive_results(
