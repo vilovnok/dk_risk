@@ -1629,7 +1629,7 @@ def parse_args():
     )
     parser.add_argument(
         "--provider",
-        choices=["aihf", "direct"],
+        choices=["aihf", "direct", "sigma"],
         default="aihf",
     )
     parser.add_argument(
