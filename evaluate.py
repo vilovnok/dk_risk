@@ -1442,7 +1442,6 @@ def log_metrics(metrics: dict):
 def run_evaluation(args):
     input_path = Path(args.input)
     output_path = Path(args.output)
-    prompt_path = Path(args.system_prompt_file)
 
     data = load_input(input_path)
     system_prompt = SYSTEM_PROMPT
@@ -1456,7 +1455,6 @@ def run_evaluation(args):
 
     logger.info("Входной файл: %s", input_path)
     logger.info("Выходной файл: %s", output_path)
-    logger.info("Системный промпт: %s", prompt_path)
     logger.info("Количество объектов: %s", total_rows)
     logger.info("Поле для LLM: %s", args.input_field)
     logger.info("Provider: %s", args.provider)
