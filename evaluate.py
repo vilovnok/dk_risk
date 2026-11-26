@@ -1482,7 +1482,7 @@ def load_system_prompt(
             f"Системный промпт пуст: {prompt_path}"
         )
 
-    return system_prompt.strip()
+    return SYSTEM_PROMPT.strip()
 
 
 # ============================================================
