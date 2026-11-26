@@ -842,10 +842,10 @@ def extract_ground_truth_names(
 ) -> set[str]:
     """Извлекает положительные категории Ground Truth."""
 
-    if not isinstance(items, list):
-        raise ValueError(
-            f"{field_description}: ожидался список."
-        )
+    # if not isinstance(items, list):
+    #     raise ValueError(
+    #         f"{field_description}: ожидался список."
+    #     )
 
     names = set()
 
@@ -885,10 +885,10 @@ def extract_predicted_names(
 ) -> set[str]:
     """Извлекает положительные категории Prediction."""
 
-    if not isinstance(items, list):
-        raise ValueError(
-            f"{field_description}: ожидался список."
-        )
+    # if not isinstance(items, list):
+    #     raise ValueError(
+    #         f"{field_description}: ожидался список."
+    #     )
 
     names = set()
 
@@ -2215,9 +2215,7 @@ def run_evaluation(args):
         source_files_map_path
     )
 
-    system_prompt = load_system_prompt(
-        prompt_path
-    )
+    system_prompt = load_system_prompt()
 
     total_rows = len(data)
 
