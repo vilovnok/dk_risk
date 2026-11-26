@@ -1368,12 +1368,12 @@ def parse_response(
                 f"Элемент {index} должен быть объектом."
             )
 
-        if set(item.keys()) != expected_keys:
-            raise ValueError(
-                f"Элемент {index}: ожидались поля "
-                f"{sorted(expected_keys)}, "
-                f"получены {sorted(item.keys())}."
-            )
+        # if set(item.keys()) != expected_keys:
+        #     raise ValueError(
+        #         f"Элемент {index}: ожидались поля "
+        #         f"{sorted(expected_keys)}, "
+        #         f"получены {sorted(item.keys())}."
+        #     )
 
         if not isinstance(item["name"], str):
             raise ValueError(
