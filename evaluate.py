@@ -1518,6 +1518,61 @@ def load_input(
     return data
 
 
+
+
+def build_full_prediction_record(
+    original_item: dict[str, Any],
+    llm_record: dict[str, Any] | None,
+    model: str,
+    timestamp: str,
+) -> dict[str, Any]:
+    """Сохраняет полный структурированный ответ модели."""
+
+    prediction = None
+    error = None
+    raw_response = None
+
+    if llm_record is None:
+        error = "LLM result is missing"
+
+    else:
+        raw_response = llm_record.get("llm_raw") or None
+
+        if llm_record.get("llm_error"):
+            error = llm_record["llm_error"]
+
+        elif llm_record.get("llm_result") is not None:
+            prediction = llm_record["llm_result"]
+
+        else:
+            error = "LLM returned no parsed result"
+
+    return {
+        "id": original_item["id"],
+        "filename": original_item.get("filename"),
+        "model": model,
+        "timestamp": timestamp,
+        "prediction": prediction,
+        "raw_response": raw_response,
+        "error": error,
+    }
+
+
+
+def append_full_predictions(
+    records: list[dict[str, Any]],
+    output_path: Path,
+) -> int:
+    """Добавляет полные ответы модели в отдельный JSON."""
+
+    return append_json_results(
+        records=records,
+        output_path=output_path,
+    )
+
+
+
+
 def validate_input(
     data: list[dict[str, Any]],
     input_field: str,
@@ -1939,19 +1994,21 @@ def append_csv_results(
 # CHECKPOINT
 # ============================================================
 
+
 def save_checkpoint(
     data: list[dict[str, Any]],
     results: dict[int, dict[str, Any]],
     row_indices: list[int],
     csv_path: Path,
     json_path: Path,
+    full_predictions_path: Path,
     model: str,
     timestamp: str,
-) -> tuple[int, int]:
-    """Сохраняет новые результаты в CSV и JSON."""
+) -> tuple[int, int, int]:
 
     csv_records = []
     json_records = []
+    full_prediction_records = []
 
     for index in row_indices:
         original_item = data[index]
@@ -1976,13 +2033,21 @@ def save_checkpoint(
                     row_index=index,
                 )
             )
-
         except (ValueError, TypeError) as exc:
             logger.warning(
-                "ID %s: не удалось сформировать JSON-запись: %s",
+                "ID %s: ошибка формирования JSON: %s",
                 original_item["id"],
                 exc,
             )
+
+        full_prediction_records.append(
+            build_full_prediction_record(
+                original_item=original_item,
+                llm_record=llm_record,
+                model=model,
+                timestamp=timestamp,
+            )
+        )
 
     csv_saved = append_csv_results(
         records=csv_records,
@@ -1994,7 +2059,12 @@ def save_checkpoint(
         output_path=json_path,
     )
 
-    return csv_saved, json_saved
+    full_saved = append_full_predictions(
+        records=full_prediction_records,
+        output_path=full_predictions_path,
+    )
+
+    return csv_saved, json_saved, full_saved
 
 
 # ============================================================
@@ -2139,6 +2209,7 @@ def run_evaluation(args):
     csv_path = Path(args.output)
     json_path = Path(args.json_output)
     prompt_path = Path(args.system_prompt_file)
+    full_predictions_path = Path(args.full_predictions_output)
 
     data = load_input(input_path)
 
@@ -2171,6 +2242,10 @@ def run_evaluation(args):
     logger.info("Модель: %s", args.model)
     logger.info("Workers: %s", args.workers)
     logger.info("Timestamp: %s", timestamp)
+    logger.info(
+    "Полные ответы модели: %s",
+    full_predictions_path,
+)
 
     results: dict[int, dict[str, Any]] = {}
     futures = {}
@@ -2231,12 +2306,13 @@ def run_evaluation(args):
                     set(results.keys()) - written_indices
                 )
 
-                csv_saved, json_saved = save_checkpoint(
+                csv_saved, json_saved, full_saved = save_checkpoint(
                     data=data,
                     results=results,
                     row_indices=pending_indices,
                     csv_path=csv_path,
                     json_path=json_path,
+                    full_predictions_path=full_predictions_path,
                     model=args.model,
                     timestamp=timestamp,
                 )
@@ -2247,26 +2323,29 @@ def run_evaluation(args):
 
                 logger.info(
                     "Прогресс: %s/%s | Успешно: %s | "
-                    "Ошибки: %s | CSV: +%s | JSON: +%s",
+                    "Ошибки: %s | CSV: +%s | JSON: +%s | Full: +%s",
                     completed,
                     total_rows,
                     successful,
                     failed,
                     csv_saved,
                     json_saved,
+                    full_saved,
                 )
+
 
     # Финальное сохранение.
     pending_indices = sorted(
         set(results.keys()) - written_indices
     )
 
-    csv_saved, json_saved = save_checkpoint(
+    csv_saved, json_saved, full_saved = save_checkpoint(
         data=data,
         results=results,
         row_indices=pending_indices,
         csv_path=csv_path,
         json_path=json_path,
+        full_predictions_path=full_predictions_path,
         model=args.model,
         timestamp=timestamp,
     )
@@ -2300,6 +2379,15 @@ def run_evaluation(args):
     logger.info(
         "Итоговый JSON: %s",
         json_path,
+    )
+    logger.info(
+        "Добавлено полных предсказаний при финальном сохранении: %s",
+        full_saved,
+    )
+
+    logger.info(
+        "Итоговый файл полных предсказаний: %s",
+        full_predictions_path,
     )
 
     logger.info("=" * 70)
@@ -2348,6 +2436,11 @@ def parse_args():
         "--input-field",
         default=INPUT_FIELD,
         help="Поле JSON с текстом для LLM.",
+    )
+    parser.add_argument(
+        "--full-predictions-output",
+        default="predictions_full.json",
+        help="Путь к JSON с полными ответами модели.",
     )
 
     parser.add_argument(
