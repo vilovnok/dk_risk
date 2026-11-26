@@ -740,9 +740,6 @@ JSON содержит следующие поля:
 """
 
 
-# ============================================================
-# CONFIG
-# ============================================================
 
 import argparse
 import csv
@@ -1537,7 +1534,6 @@ def parse_response(
 # ============================================================
 
 def load_system_prompt() -> str:
-
     return SYSTEM_PROMPT
 
 
@@ -2281,7 +2277,9 @@ def run_evaluation(args):
         source_files_map_path
     )
 
-    system_prompt = load_system_prompt()
+    system_prompt = load_system_prompt(
+        prompt_path
+    )
 
     total_rows = len(data)
 
@@ -2648,40 +2646,13 @@ if __name__ == "__main__":
         raise
 
 
-# python evaluate.py \
-#     --input ./prepared/pool_2_prepared.json \
-#     --output ./results/pool_2_prepared.csv \
-#     --json-output ./results/pool_2_prepared.json \
-#     --provider aihf \
-#     --model DeepSeek-V4.1-Flash \
-#     --workers 5
-
 
 # python evaluate.py \
-#     --input tagme_dataset.csv \
-#     --output results.csv \
-#     --input-column dialogue_with_criterion \
-#     --provider aihf \
-#     --model DeepSeek-V4.1-Flash \
-#     --workers 5 \
-#     --temperature 0.2 \
-#     --top-p 1.0
-
-
-# python evaluate.py \
-#     --input tagme_dataset.csv \
-#     --output results.csv \
-#     --provider direct \
-#     --workers 5
-
-
-
-# python evaluate.py \
-#   --input ./prepared/pool_2_prepared.json \
-#   --output ./results/pool_2_prepared.csv \
-#   --json-output ./results/pool_2_prepared.json \
-#   --full-predictions-output ./results/predictions_full.json \
-#   --system-prompt-file ./system_prompt.txt \
+#   --input prepared.json \
+#   --source-files-map source_files_map.json \
+#   --output results/evaluation_results.csv \
+#   --json-output results/evaluation_results.json \
+#   --full-predictions-output results/predictions_full.json \
+#   --metrics-output results/evaluation_metrics.json \
 #   --provider aihf \
-#   --model DeepSeek-V4.1-Flash \
-#   --workers 5
+#   --workers 20
