@@ -2543,3 +2543,15 @@ if __name__ == "__main__":
 #     --output results.csv \
 #     --provider direct \
 #     --workers 5
+
+
+
+# python evaluate.py \
+#   --input ./prepared/pool_2_prepared.json \
+#   --output ./results/pool_2_prepared.csv \
+#   --json-output ./results/pool_2_prepared.json \
+#   --full-predictions-output ./results/predictions_full.json \
+#   --system-prompt-file ./system_prompt.txt \
+#   --provider aihf \
+#   --model DeepSeek-V4.1-Flash \
+#   --workers 5
