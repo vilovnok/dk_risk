@@ -1464,24 +1464,7 @@ def parse_response(
 # SYSTEM PROMPT
 # ============================================================
 
-def load_system_prompt(
-    prompt_path: Path,
-) -> str:
-
-    if not prompt_path.exists():
-        raise FileNotFoundError(
-            f"Файл системного промпта не найден: {prompt_path}"
-        )
-
-    system_prompt = prompt_path.read_text(
-        encoding="utf-8-sig"
-    )
-
-    if not system_prompt.strip():
-        raise ValueError(
-            f"Системный промпт пуст: {prompt_path}"
-        )
-
+def load_system_prompt() -> str:
     return SYSTEM_PROMPT.strip()
 
 
@@ -2218,9 +2201,7 @@ def run_evaluation(args):
         input_field=args.input_field,
     )
 
-    system_prompt = load_system_prompt(
-        prompt_path
-    )
+    system_prompt = load_system_prompt()
 
     total_rows = len(data)
 
