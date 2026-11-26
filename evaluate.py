@@ -897,12 +897,6 @@ def normalize_answer(answer: Any) -> str:
     )
 
 
-def is_positive_answer(answer: Any) -> bool:
-    """Проверяет, является ли answer положительным."""
-
-    return normalize_answer(answer) == "1"
-
-
 # ============================================================
 # NAME EXTRACTION
 # ============================================================
@@ -911,14 +905,7 @@ def extract_ground_truth_names(
     items: Any,
     field_description: str,
 ) -> set[str]:
-    """
-    Извлекает положительные критерии из Ground Truth.
-
-    Ground Truth:
-        result[*].name, если result[*].answer == 1.
-
-    fork исключается.
-    """
+    """Извлекает положительные категории Ground Truth."""
 
     if not isinstance(items, list):
         raise ValueError(
@@ -961,15 +948,7 @@ def extract_predicted_names(
     items: Any,
     field_description: str,
 ) -> set[str]:
-    """
-    Извлекает положительные критерии из ответа LLM.
-
-    Prediction:
-        result[*].name, если result[*].answer == 1.
-
-    mention и reason не участвуют в сравнении.
-    fork исключается.
-    """
+    """Извлекает положительные категории Prediction."""
 
     if not isinstance(items, list):
         raise ValueError(
@@ -1016,21 +995,7 @@ def extract_expected_names(
     user_prompt: str,
     item_id: str,
 ) -> set[str]:
-    """
-    Извлекает полный список критериев из part_system_prompt.
-
-    Ожидаемая структура:
-        {
-            "data": {
-                "dialogue": "..."
-            },
-            "premarkup": {
-                "classes": [
-                    {"name": "..."}
-                ]
-            }
-        }
-    """
+    """Извлекает полный список критериев из part_system_prompt."""
 
     try:
         payload = json.loads(user_prompt)
@@ -1100,6 +1065,124 @@ def extract_expected_names(
         expected_names.add(name)
 
     return expected_names
+
+
+# ============================================================
+# SOURCE FILE MAPPING
+# ============================================================
+
+def normalize_source_files(
+    value: Any,
+    context: str,
+) -> list[str]:
+    """Проверяет и нормализует список исходных файлов."""
+
+    if value is None:
+        return []
+
+    if isinstance(value, str):
+        value = [value]
+
+    if not isinstance(value, list):
+        raise ValueError(
+            f"{context}: ожидалась строка или список файлов."
+        )
+
+    result = []
+
+    for file_path in value:
+        if not isinstance(file_path, str) or not file_path.strip():
+            raise ValueError(
+                f"{context}: обнаружено некорректное имя файла."
+            )
+
+        file_path = file_path.strip()
+
+        if file_path not in result:
+            result.append(file_path)
+
+    return result
+
+
+def load_source_files_map(
+    mapping_path: Path | None,
+) -> dict[str, list[str]]:
+    """
+    Загружает связи id -> source_files.
+
+    Ожидаемый формат:
+
+    {
+        "12345": ["part_01.json", "part_03.json"],
+        "12346": ["part_02.json"]
+    }
+    """
+
+    if mapping_path is None:
+        return {}
+
+    if not mapping_path.exists():
+        raise FileNotFoundError(
+            f"Файл связей исходных файлов не найден: {mapping_path}"
+        )
+
+    with mapping_path.open(
+        "r",
+        encoding="utf-8-sig",
+    ) as file:
+        data = json.load(file)
+
+    if not isinstance(data, dict):
+        raise ValueError(
+            "Файл source-files-map должен содержать JSON-объект "
+            "с ключами id и списками файлов."
+        )
+
+    result = {}
+
+    for item_id, files in data.items():
+        if not isinstance(item_id, str) or not item_id.strip():
+            raise ValueError(
+                "В source-files-map обнаружен некорректный id."
+            )
+
+        result[item_id] = normalize_source_files(
+            files,
+            f"source-files-map, id={item_id}",
+        )
+
+    return result
+
+
+def get_source_files(
+    original_item: dict[str, Any],
+    source_files_map: dict[str, list[str]],
+) -> list[str]:
+    """
+    Объединяет связи из prepared JSON и внешнего mapping.
+
+    Дубликаты удаляются с сохранением порядка.
+    """
+
+    item_id = original_item["id"]
+
+    item_files = normalize_source_files(
+        original_item.get("source_files"),
+        f"prepared JSON, id={item_id}",
+    )
+
+    mapped_files = source_files_map.get(
+        item_id,
+        [],
+    )
+
+    result = []
+
+    for file_path in item_files + mapped_files:
+        if file_path not in result:
+            result.append(file_path)
+
+    return result
 
 
 # ============================================================
@@ -1322,18 +1405,7 @@ def parse_response(
     raw_response: str,
     expected_names: set[str],
 ) -> list[dict[str, str]]:
-    """
-    Проверяет структуру ответа LLM и полноту списка критериев.
-
-    Для каждого критерия ожидаются поля:
-        name
-        answer
-        mention
-        reason
-
-    Каждый критерий из premarkup.classes должен присутствовать
-    ровно один раз.
-    """
+    """Проверяет структуру ответа LLM и полноту списка критериев."""
 
     result = json.loads(
         extract_json_array(raw_response)
@@ -1347,19 +1419,19 @@ def parse_response(
     normalized_result = []
     received_names = set()
 
+    expected_keys = {
+        "name",
+        "answer",
+        "mention",
+        "reason",
+    }
+
     for index, item in enumerate(result):
 
         if not isinstance(item, dict):
             raise ValueError(
                 f"Элемент {index} должен быть объектом."
             )
-
-        expected_keys = {
-            "name",
-            "answer",
-            "mention",
-            "reason",
-        }
 
         if set(item.keys()) != expected_keys:
             raise ValueError(
@@ -1465,7 +1537,8 @@ def parse_response(
 # ============================================================
 
 def load_system_prompt() -> str:
-    return SYSTEM_PROMPT.strip()
+
+    return SYSTEM_PROMPT
 
 
 # ============================================================
@@ -1499,61 +1572,6 @@ def load_input(
             )
 
     return data
-
-
-
-
-def build_full_prediction_record(
-    original_item: dict[str, Any],
-    llm_record: dict[str, Any] | None,
-    model: str,
-    timestamp: str,
-) -> dict[str, Any]:
-    """Сохраняет полный структурированный ответ модели."""
-
-    prediction = None
-    error = None
-    raw_response = None
-
-    if llm_record is None:
-        error = "LLM result is missing"
-
-    else:
-        raw_response = llm_record.get("llm_raw") or None
-
-        if llm_record.get("llm_error"):
-            error = llm_record["llm_error"]
-
-        elif llm_record.get("llm_result") is not None:
-            prediction = llm_record["llm_result"]
-
-        else:
-            error = "LLM returned no parsed result"
-
-    return {
-        "id": original_item["id"],
-        "filename": original_item.get("filename"),
-        "model": model,
-        "timestamp": timestamp,
-        "prediction": prediction,
-        "raw_response": raw_response,
-        "error": error,
-    }
-
-
-
-def append_full_predictions(
-    records: list[dict[str, Any]],
-    output_path: Path,
-) -> int:
-    """Добавляет полные ответы модели в отдельный JSON."""
-
-    return append_json_results(
-        records=records,
-        output_path=output_path,
-    )
-
-
 
 
 def validate_input(
@@ -1623,6 +1641,64 @@ def validate_input(
             f"В объектах отсутствует корректное поле "
             f"'{input_field}'. Индексы: {missing_input[:10]}"
         )
+
+
+# ============================================================
+# FULL PREDICTION RECORD
+# ============================================================
+
+def build_full_prediction_record(
+    original_item: dict[str, Any],
+    llm_record: dict[str, Any] | None,
+    model: str,
+    timestamp: str,
+    source_files_map: dict[str, list[str]],
+) -> dict[str, Any]:
+    """Сохраняет полный структурированный ответ модели."""
+
+    prediction = None
+    error = None
+    raw_response = None
+
+    if llm_record is None:
+        error = "LLM result is missing"
+
+    else:
+        raw_response = llm_record.get("llm_raw") or None
+
+        if llm_record.get("llm_error"):
+            error = llm_record["llm_error"]
+
+        elif llm_record.get("llm_result") is not None:
+            prediction = llm_record["llm_result"]
+
+        else:
+            error = "LLM returned no parsed result"
+
+    return {
+        "id": original_item["id"],
+        "source_files": get_source_files(
+            original_item,
+            source_files_map,
+        ),
+        "model": model,
+        "timestamp": timestamp,
+        "prediction": prediction,
+        "raw_response": raw_response,
+        "error": error,
+    }
+
+
+def append_full_predictions(
+    records: list[dict[str, Any]],
+    output_path: Path,
+) -> int:
+    """Добавляет полные ответы модели в отдельный JSON."""
+
+    return append_json_results(
+        records=records,
+        output_path=output_path,
+    )
 
 
 # ============================================================
@@ -1717,19 +1793,8 @@ def build_result_record(
     llm_record: dict[str, Any] | None,
     model: str,
     timestamp: str,
-    row_index: int,
 ) -> dict[str, Any]:
-    """
-    Формирует подробную запись для JSON.
-
-    gt_ground_truth:
-        только положительные категории Ground Truth.
-
-    prediction:
-        только положительные категории Prediction.
-
-    Если LLM завершилась ошибкой, prediction = null.
-    """
+    """Формирует подробную запись Ground Truth и Prediction."""
 
     item_id = original_item["id"]
 
@@ -1829,10 +1894,10 @@ def build_csv_row(
 # ============================================================
 
 def atomic_save_json(
-    data: list[dict[str, Any]],
+    data: Any,
     output_path: Path,
 ):
-    """Атомарная запись JSON через временный файл."""
+    """Атомарно сохраняет JSON-объект или массив."""
 
     output_path.parent.mkdir(
         parents=True,
@@ -1867,9 +1932,9 @@ def append_json_results(
     output_path: Path,
 ) -> int:
     """
-    Добавляет подробные результаты в JSON.
+    Добавляет результаты в JSON.
 
-    Уникальность записи:
+    Уникальность:
         id + model + timestamp.
 
     Существующие результаты других запусков сохраняются.
@@ -1977,7 +2042,6 @@ def append_csv_results(
 # CHECKPOINT
 # ============================================================
 
-
 def save_checkpoint(
     data: list[dict[str, Any]],
     results: dict[int, dict[str, Any]],
@@ -1985,9 +2049,13 @@ def save_checkpoint(
     csv_path: Path,
     json_path: Path,
     full_predictions_path: Path,
+    source_files_map: dict[str, list[str]],
     model: str,
     timestamp: str,
 ) -> tuple[int, int, int]:
+
+    if not row_indices:
+        return 0, 0, 0
 
     csv_records = []
     json_records = []
@@ -2013,9 +2081,9 @@ def save_checkpoint(
                     llm_record=llm_record,
                     model=model,
                     timestamp=timestamp,
-                    row_index=index,
                 )
             )
+
         except (ValueError, TypeError) as exc:
             logger.warning(
                 "ID %s: ошибка формирования JSON: %s",
@@ -2029,6 +2097,7 @@ def save_checkpoint(
                 llm_record=llm_record,
                 model=model,
                 timestamp=timestamp,
+                source_files_map=source_files_map,
             )
         )
 
@@ -2107,10 +2176,10 @@ def calculate_metrics(
         else None
     )
 
-    total_empty = sum(
+    records_without_attempts = sum(
         1
         for result in results.values()
-        if result["llm_attempts"] == 0
+        if result.get("llm_attempts", 0) == 0
     )
 
     return {
@@ -2120,7 +2189,7 @@ def calculate_metrics(
         "correct_records": correct,
         "failed_records": failed,
         "invalid_gold_records": invalid_gold,
-        "empty_input_records": total_empty,
+        "records_without_llm_attempts": records_without_attempts,
         "exact_match_accuracy": accuracy,
     }
 
@@ -2161,8 +2230,8 @@ def log_metrics(metrics: dict[str, Any]):
     )
 
     logger.info(
-        "Без запроса к LLM: %s",
-        metrics["empty_input_records"],
+        "Без попыток обращения к LLM: %s",
+        metrics["records_without_llm_attempts"],
     )
 
     accuracy = metrics["exact_match_accuracy"]
@@ -2193,6 +2262,13 @@ def run_evaluation(args):
     json_path = Path(args.json_output)
     prompt_path = Path(args.system_prompt_file)
     full_predictions_path = Path(args.full_predictions_output)
+    metrics_path = Path(args.metrics_output)
+
+    source_files_map_path = (
+        Path(args.source_files_map)
+        if args.source_files_map
+        else None
+    )
 
     data = load_input(input_path)
 
@@ -2201,32 +2277,48 @@ def run_evaluation(args):
         input_field=args.input_field,
     )
 
+    source_files_map = load_source_files_map(
+        source_files_map_path
+    )
+
     system_prompt = load_system_prompt()
 
     total_rows = len(data)
 
     timestamp = datetime.now().astimezone().isoformat(
-        timespec="seconds"
+        timespec="microseconds"
     )
 
     logger.info("=" * 70)
     logger.info("ЗАПУСК ОЦЕНКИ")
     logger.info("=" * 70)
 
-    logger.info("Входной файл: %s", input_path)
-    logger.info("Системный промпт: %s", prompt_path)
-    logger.info("Выходной CSV: %s", csv_path)
-    logger.info("Выходной JSON: %s", json_path)
+    logger.info("Входной файл: %s", input_path.resolve())
+    logger.info("Системный промпт: %s", prompt_path.resolve())
+    logger.info("Выходной CSV: %s", csv_path.resolve())
+    logger.info("Выходной JSON: %s", json_path.resolve())
+    logger.info(
+        "Полные ответы модели: %s",
+        full_predictions_path.resolve(),
+    )
+    logger.info(
+        "Итоговые метрики: %s",
+        metrics_path.resolve(),
+    )
+
+    logger.info(
+        "Файл связей исходных файлов: %s",
+        source_files_map_path.resolve()
+        if source_files_map_path
+        else "не задан",
+    )
+
     logger.info("Количество объектов: %s", total_rows)
     logger.info("Поле для LLM: %s", args.input_field)
     logger.info("Provider: %s", args.provider)
     logger.info("Модель: %s", args.model)
     logger.info("Workers: %s", args.workers)
     logger.info("Timestamp: %s", timestamp)
-    logger.info(
-    "Полные ответы модели: %s",
-    full_predictions_path,
-)
 
     results: dict[int, dict[str, Any]] = {}
     futures = {}
@@ -2287,13 +2379,18 @@ def run_evaluation(args):
                     set(results.keys()) - written_indices
                 )
 
-                csv_saved, json_saved, full_saved = save_checkpoint(
+                (
+                    csv_saved,
+                    json_saved,
+                    full_saved,
+                ) = save_checkpoint(
                     data=data,
                     results=results,
                     row_indices=pending_indices,
                     csv_path=csv_path,
                     json_path=json_path,
                     full_predictions_path=full_predictions_path,
+                    source_files_map=source_files_map,
                     model=args.model,
                     timestamp=timestamp,
                 )
@@ -2304,7 +2401,8 @@ def run_evaluation(args):
 
                 logger.info(
                     "Прогресс: %s/%s | Успешно: %s | "
-                    "Ошибки: %s | CSV: +%s | JSON: +%s | Full: +%s",
+                    "Ошибки: %s | CSV: +%s | JSON: +%s | "
+                    "Full: +%s",
                     completed,
                     total_rows,
                     successful,
@@ -2314,19 +2412,26 @@ def run_evaluation(args):
                     full_saved,
                 )
 
+    # ========================================================
+    # FINAL SAVE
+    # ========================================================
 
-    # Финальное сохранение.
     pending_indices = sorted(
         set(results.keys()) - written_indices
     )
 
-    csv_saved, json_saved, full_saved = save_checkpoint(
+    (
+        csv_saved,
+        json_saved,
+        full_saved,
+    ) = save_checkpoint(
         data=data,
         results=results,
         row_indices=pending_indices,
         csv_path=csv_path,
         json_path=json_path,
         full_predictions_path=full_predictions_path,
+        source_files_map=source_files_map,
         model=args.model,
         timestamp=timestamp,
     )
@@ -2335,9 +2440,28 @@ def run_evaluation(args):
         pending_indices
     )
 
+    # ========================================================
+    # FINAL METRICS
+    # ========================================================
+
     metrics = calculate_metrics(
         data=data,
         results=results,
+    )
+
+    metrics.update({
+        "model": args.model,
+        "provider": args.provider,
+        "timestamp": timestamp,
+        "input_file": str(input_path.resolve()),
+        "system_prompt_file": str(prompt_path.resolve()),
+        "total_source_files_mapping": len(source_files_map),
+    })
+
+    # Сохраняем финальные метрики независимо от CSV и JSON.
+    atomic_save_json(
+        metrics,
+        metrics_path,
     )
 
     log_metrics(metrics)
@@ -2353,22 +2477,32 @@ def run_evaluation(args):
     )
 
     logger.info(
-        "Итоговый CSV: %s",
-        csv_path,
-    )
-
-    logger.info(
-        "Итоговый JSON: %s",
-        json_path,
-    )
-    logger.info(
         "Добавлено полных предсказаний при финальном сохранении: %s",
         full_saved,
     )
 
+    logger.info("=" * 70)
+    logger.info("ИТОГОВЫЕ ФАЙЛЫ")
+    logger.info("=" * 70)
+
     logger.info(
-        "Итоговый файл полных предсказаний: %s",
-        full_predictions_path,
+        "CSV: %s",
+        csv_path.resolve(),
+    )
+
+    logger.info(
+        "JSON: %s",
+        json_path.resolve(),
+    )
+
+    logger.info(
+        "Полные предсказания: %s",
+        full_predictions_path.resolve(),
+    )
+
+    logger.info(
+        "Итоговые метрики: %s",
+        metrics_path.resolve(),
     )
 
     logger.info("=" * 70)
@@ -2408,6 +2542,27 @@ def parse_args():
     )
 
     parser.add_argument(
+        "--full-predictions-output",
+        default="predictions_full.json",
+        help="Путь к JSON с полными ответами модели.",
+    )
+
+    parser.add_argument(
+        "--metrics-output",
+        default="evaluation_metrics.json",
+        help="Путь к JSON с итоговыми метриками.",
+    )
+
+    parser.add_argument(
+        "--source-files-map",
+        default=None,
+        help=(
+            "JSON-файл со связями id -> список исходных файлов. "
+            "Формат: {\"12345\": [\"part_01.json\"]}."
+        ),
+    )
+
+    parser.add_argument(
         "--system-prompt-file",
         default="system_prompt.txt",
         help="Путь к файлу системного промпта.",
@@ -2417,11 +2572,6 @@ def parse_args():
         "--input-field",
         default=INPUT_FIELD,
         help="Поле JSON с текстом для LLM.",
-    )
-    parser.add_argument(
-        "--full-predictions-output",
-        default="predictions_full.json",
-        help="Путь к JSON с полными ответами модели.",
     )
 
     parser.add_argument(
@@ -2496,7 +2646,6 @@ if __name__ == "__main__":
             "Критическая ошибка."
         )
         raise
-
 
 
 # python evaluate.py \
