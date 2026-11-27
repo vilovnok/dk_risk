@@ -44,7 +44,7 @@ from typing import Any
 from crowd_sdk.tagme import TagmeClientAdvanced
 
 
-from prompts.system_prompt import SYSTEM_PROMPT
+from prompts.system_prompt_2 import SYSTEM_PROMPT
 
 # ============================================================
 # CONFIGURATION
