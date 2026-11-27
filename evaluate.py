@@ -726,6 +726,7 @@ SYSTEM_PROMPT = f"""
 """.strip()
 
 
+
 import argparse
 import csv
 import json
@@ -769,8 +770,10 @@ DEFAULT_TOP_P = 1.0
 MAX_TOKENS = 8000
 TIMEOUT = (60, 180)
 
-MAX_RETRIES = 3
-RETRY_DELAYS = (2, 4)
+# Бесконечные повторные попытки.
+RETRY_INITIAL_DELAY = 5
+RETRY_MAX_DELAY = 30
+RETRY_BACKOFF = 2
 
 INPUT_FIELD = "part_system_prompt"
 CHECKPOINT_EVERY = 10
@@ -889,11 +892,6 @@ def extract_ground_truth_names(
 ) -> set[str]:
     """Извлекает положительные категории Ground Truth."""
 
-    # if not isinstance(items, list):
-    #     raise ValueError(
-    #         f"{field_description}: ожидался список."
-    #     )
-
     names = set()
 
     for index, item in enumerate(items):
@@ -931,11 +929,6 @@ def extract_predicted_names(
     field_description: str,
 ) -> set[str]:
     """Извлекает положительные категории Prediction."""
-
-    # if not isinstance(items, list):
-    #     raise ValueError(
-    #         f"{field_description}: ожидался список."
-    #     )
 
     names = set()
 
@@ -1215,6 +1208,8 @@ class GigaChatClient:
         user_prompt: str,
     ) -> str:
 
+        # Формируем payload один раз.
+        # При повторных отправках содержимое запроса не меняется.
         payload = {
             "model": self.model,
             "messages": [
@@ -1233,6 +1228,9 @@ class GigaChatClient:
             "profanity_check": False,
         }
 
+        # Внутренний цикл нужен для обработки 401.
+        # Если обновление токена не помогло, исключение
+        # попадёт во внешний цикл повторных попыток.
         headers = {
             "Authorization": f"Bearer {self.token}",
             "Content-Type": "application/json",
@@ -1248,7 +1246,7 @@ class GigaChatClient:
 
         if response.status_code == 401:
             logger.warning(
-                "HTTP 401. Обновляю токен."
+                "HTTP 401. Обновляю токен и повторяю тот же запрос."
             )
 
             self.token = self._get_token()
@@ -1401,13 +1399,6 @@ def parse_response(
     normalized_result = []
     received_names = set()
 
-    expected_keys = {
-        "name",
-        "answer",
-        "mention",
-        "reason",
-    }
-
     for index, item in enumerate(result):
 
         if not isinstance(item, dict):
@@ -1415,12 +1406,25 @@ def parse_response(
                 f"Элемент {index} должен быть объектом."
             )
 
-        # if set(item.keys()) != expected_keys:
-        #     raise ValueError(
-        #         f"Элемент {index}: ожидались поля "
-        #         f"{sorted(expected_keys)}, "
-        #         f"получены {sorted(item.keys())}."
-        #     )
+        if "name" not in item:
+            raise ValueError(
+                f"Элемент {index}: отсутствует поле name."
+            )
+
+        if "answer" not in item:
+            raise ValueError(
+                f"Элемент {index}: отсутствует поле answer."
+            )
+
+        if "mention" not in item:
+            raise ValueError(
+                f"Элемент {index}: отсутствует поле mention."
+            )
+
+        if "reason" not in item:
+            raise ValueError(
+                f"Элемент {index}: отсутствует поле reason."
+            )
 
         if not isinstance(item["name"], str):
             raise ValueError(
@@ -1701,6 +1705,8 @@ def evaluate_record(
         "llm_attempts": 0,
     }
 
+    # Проверяем входные критерии один раз.
+    # Некорректные входные данные не исправятся повторной отправкой.
     try:
         expected_names = extract_expected_names(
             user_prompt=user_prompt,
@@ -1711,58 +1717,80 @@ def evaluate_record(
         result["llm_error"] = (
             f"Ошибка входных критериев: {exc}"
         )
+
+        logger.error(
+            "Объект %s | ошибка входных критериев: %s",
+            row_index,
+            exc,
+        )
+
         return result
 
-    last_error = None
+    attempt = 0
+    retry_delay = RETRY_INITIAL_DELAY
 
-    for attempt in range(1, MAX_RETRIES + 1):
+    while True:
+        attempt += 1
         result["llm_attempts"] = attempt
 
         try:
             client = get_client(args)
 
+            # Отправляем тот же запрос.
             raw_response = client.invoke(
                 system_prompt=system_prompt,
                 user_prompt=user_prompt,
             )
 
-            result["llm_raw"] = raw_response
-
-            result["llm_result"] = parse_response(
+            # Проверяем ответ.
+            parsed_result = parse_response(
                 raw_response=raw_response,
                 expected_names=expected_names,
             )
 
+            # Сохраняем только полностью проверенный результат.
+            result["llm_raw"] = raw_response
+            result["llm_result"] = parsed_result
             result["llm_error"] = ""
+
+            logger.info(
+                "Объект %s | успешно обработан | попыток: %s",
+                row_index,
+                attempt,
+            )
 
             return result
 
+        except KeyboardInterrupt:
+            raise
+
         except Exception as exc:
-            last_error = exc
 
             logger.warning(
-                "Объект %s | попытка %s/%s | ошибка: %s",
+                "Объект %s | попытка %s | ошибка: %s",
                 row_index,
                 attempt,
-                MAX_RETRIES,
                 exc,
             )
 
+            # Закрываем старый клиент.
+            # При следующей попытке создаётся новый клиент
+            # с актуальным токеном и новой HTTP-сессией.
             reset_client()
 
-            if attempt < MAX_RETRIES:
-                delay = RETRY_DELAYS[
-                    min(
-                        attempt - 1,
-                        len(RETRY_DELAYS) - 1,
-                    )
-                ]
+            logger.warning(
+                "Объект %s | повторная отправка того же запроса "
+                "через %s секунд.",
+                row_index,
+                retry_delay,
+            )
 
-                time.sleep(delay)
+            time.sleep(retry_delay)
 
-    result["llm_error"] = str(last_error)
-
-    return result
+            retry_delay = min(
+                retry_delay * RETRY_BACKOFF,
+                RETRY_MAX_DELAY,
+            )
 
 
 # ============================================================
@@ -2278,10 +2306,12 @@ def run_evaluation(args):
     logger.info("Системный промпт: %s", prompt_path.resolve())
     logger.info("Выходной CSV: %s", csv_path.resolve())
     logger.info("Выходной JSON: %s", json_path.resolve())
+
     logger.info(
         "Полные ответы модели: %s",
         full_predictions_path.resolve(),
     )
+
     logger.info(
         "Итоговые метрики: %s",
         metrics_path.resolve(),
@@ -2439,7 +2469,6 @@ def run_evaluation(args):
         "total_source_files_mapping": len(source_files_map),
     })
 
-    # Сохраняем финальные метрики независимо от CSV и JSON.
     atomic_save_json(
         metrics,
         metrics_path,
