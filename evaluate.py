@@ -771,9 +771,11 @@ MAX_TOKENS = 8000
 TIMEOUT = (60, 180)
 
 # Бесконечные повторные попытки.
-RETRY_INITIAL_DELAY = 5
+RETRY_INITIAL_DELAY = 2
 RETRY_MAX_DELAY = 30
 RETRY_BACKOFF = 2
+MAX_RETRIES = 3
+RETRY_DELAY = 2
 
 INPUT_FIELD = "part_system_prompt"
 CHECKPOINT_EVERY = 10
@@ -1726,23 +1728,18 @@ def evaluate_record(
 
         return result
 
-    attempt = 0
-    retry_delay = RETRY_INITIAL_DELAY
-
-    while True:
-        attempt += 1
+    for attempt in range(1, MAX_RETRIES + 1):
         result["llm_attempts"] = attempt
 
         try:
             client = get_client(args)
 
-            # Отправляем тот же запрос.
+            # При каждой попытке отправляется тот же запрос.
             raw_response = client.invoke(
                 system_prompt=system_prompt,
                 user_prompt=user_prompt,
             )
 
-            # Проверяем ответ.
             parsed_result = parse_response(
                 raw_response=raw_response,
                 expected_names=expected_names,
@@ -1765,33 +1762,36 @@ def evaluate_record(
             raise
 
         except Exception as exc:
+            result["llm_error"] = str(exc)
 
             logger.warning(
-                "Объект %s | попытка %s | ошибка: %s",
+                "Объект %s | попытка %s/%s | ошибка: %s",
                 row_index,
                 attempt,
+                MAX_RETRIES,
                 exc,
             )
 
             # Закрываем старый клиент.
-            # При следующей попытке создаётся новый клиент
-            # с актуальным токеном и новой HTTP-сессией.
+            # Следующая попытка создаст новую сессию и получит токен.
             reset_client()
 
-            logger.warning(
-                "Объект %s | повторная отправка того же запроса "
-                "через %s секунд.",
-                row_index,
-                retry_delay,
-            )
+            if attempt < MAX_RETRIES:
+                logger.warning(
+                    "Объект %s | повторная отправка через %s секунды.",
+                    row_index,
+                    RETRY_DELAY,
+                )
 
-            time.sleep(retry_delay)
+                time.sleep(RETRY_DELAY)
 
-            retry_delay = min(
-                retry_delay * RETRY_BACKOFF,
-                RETRY_MAX_DELAY,
-            )
+    logger.error(
+        "Объект %s | не удалось обработать после %s попыток.",
+        row_index,
+        MAX_RETRIES,
+    )
 
+    return result
 
 # ============================================================
 # RESULT BUILDING
