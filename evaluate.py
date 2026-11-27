@@ -44,6 +44,8 @@ from typing import Any
 from crowd_sdk.tagme import TagmeClientAdvanced
 
 
+from prompts.system_prompt import SYSTEM_PROMPT
+
 # ============================================================
 # CONFIGURATION
 # ============================================================
@@ -2233,9 +2235,11 @@ def run_evaluation(args):
         source_files_map_path
     )
 
-    system_prompt = load_system_prompt(
-        prompt_path
-    )
+    # system_prompt = load_system_prompt(
+    #     prompt_path
+    # )
+
+    system_prompt = SYSTEM_PROMPT 
 
     total_rows = len(data)
 
@@ -2749,6 +2753,6 @@ if __name__ == "__main__":
 # python evaluate.py \
 #     --input ./predicts/pool_1_prepared.json \
 #     --system-prompt-file prompts/system_prompt.md \
-#     --provider aihf \
+#     --provider sigma \
 #     --model DeepSeek-V4.1-Flash \
 #     --workers 20
